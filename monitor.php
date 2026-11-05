@@ -36,7 +36,7 @@ const ESM_HTTP_PROBES_PER_REQUEST = 1;
 const ESM_MONITOR_REMOTE_MOUNTS = false;
 // Keep remote mounts disabled by default; explicitly allow only trusted paths.
 // FUSE network calls may still block when a 60-second cache entry expires.
-const ESM_REMOTE_MOUNT_ALLOWLIST = ['/CLOUDS/Google_Drive'];
+const ESM_REMOTE_MOUNT_ALLOWLIST = [];
 
 // The local probe connects to a fixed loopback IP, never a user-supplied Host header.
 // Set ESM_SELF_CHECK_HOST to the certificate's DNS name for HTTPS virtual hosts.
