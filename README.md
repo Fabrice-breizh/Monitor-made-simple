@@ -2,7 +2,7 @@
 
 **A lightweight Linux monitoring dashboard in a single PHP file.** No database, no agent, no external assets, no dependencies: drop `monitor.php` on your web server, set a password, and open it in your browser.
 
-<img src="monitor_made_simple.png" alt="Monitor made Simple dashboard" width="900">
+<img src="screenshots/monitor_made_simple.png" alt="Monitor made Simple dashboard" width="900">
 
 ## Features
 
