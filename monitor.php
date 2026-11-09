@@ -1,6 +1,6 @@
 <?php
 /**
- * Monitor made Simple 1.2.0 — single-file Linux monitoring dashboard.
+ * Monitor made Simple 1.2.1 — single-file Linux monitoring dashboard.
  * PHP 8.1+, no external assets or database.
  * HTTP Basic authentication is mandatory for the page and JSON API.
  */
@@ -12,10 +12,16 @@ declare(strict_types=1);
 const ESM_TITLE = 'Monitor made Simple';
 const ESM_REFRESH_SECONDS = 5;
 const ESM_AUTH_USER = 'admin';
+// true = refuse plain HTTP (HTTPS, or a reverse proxy sending X-Forwarded-Proto: https, is required).
+const ESM_REQUIRE_HTTPS = false;
+// Behind a reverse proxy that terminates HTTPS: set to true so its X-Forwarded-Proto header is
+// trusted, and only when the request comes from one of these proxy addresses.
+const ESM_TRUST_PROXY_HTTPS = false;
+const ESM_TRUSTED_PROXIES = ['127.0.0.1', '::1'];
 
 // Set a password hash via the ESM_PASSWORD_HASH environment variable (recommended),
 // or paste a password_hash() result below. Never store a plaintext password here.
-const ESM_PASSWORD_HASH = 'GENERATE_ME';
+const ESM_PASSWORD_HASH = '';
 // No hash means HTTP 401 for every request, including the JSON API.
 // Never bypass authentication based on REMOTE_ADDR: reverse proxies may use loopback.
 
@@ -33,6 +39,8 @@ const ESM_SERVICES_CACHE_SECONDS = 12;
 const ESM_INODES_CACHE_SECONDS = 45;
 const ESM_REMOTE_MOUNT_CACHE_SECONDS = 60;
 const ESM_HTTP_CACHE_SECONDS = 60;
+const ESM_HTTP_RETRY_SECONDS = 15;   // a failed HTTP check is retried sooner than a successful one
+const ESM_HTTP_TIMEOUT_SECONDS = 1.2; // connection + response headers, per HTTP check
 const ESM_GPU_CACHE_SECONDS = 10;
 const ESM_SYSTEMD_CACHE_SECONDS = 60;
 const ESM_REBOOT_CACHE_SECONDS = 120;
@@ -69,7 +77,7 @@ function esmNonce(): string
 }
 
 header('X-Content-Type-Options: nosniff');
-header('X-Monitor-Made-Simple: 1.2.0');
+header('X-Monitor-Made-Simple: 1.2.1');
 header('Referrer-Policy: no-referrer');
 header('X-Frame-Options: DENY');
 header('Cache-Control: private, no-store, max-age=0');
@@ -108,6 +116,23 @@ function esmAuthorized(): bool
     }
     return false;
 }
+
+function esmIsHttps(): bool
+{
+    $https = strtolower((string) ($_SERVER['HTTPS'] ?? ''));
+    if ($https !== '' && $https !== 'off') return true;
+    if ((string) ($_SERVER['REQUEST_SCHEME'] ?? '') === 'https') return true;
+    if (!ESM_TRUST_PROXY_HTTPS || !in_array((string) ($_SERVER['REMOTE_ADDR'] ?? ''), ESM_TRUSTED_PROXIES, true)) return false;
+    return strtolower(trim(explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''))[0])) === 'https';
+}
+if (ESM_REQUIRE_HTTPS && !esmIsHttps()) {
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "HTTPS is required for this dashboard.\n";
+    exit;
+}
+// Tells the browser to use HTTPS for the next visits (it cannot protect a very first plain HTTP visit).
+if (esmIsHttps()) header('Strict-Transport-Security: max-age=31536000');
 
 if (!esmAuthorized()) {
     http_response_code(401);
@@ -170,13 +195,28 @@ function esmCacheWrite(string $key, array $value): void
 }
 function esmCachedCollect(string $key, int $seconds, callable $collector): array
 {
+    $fresh = static fn(?array $entry): bool => $entry !== null && isset($entry['at'], $entry['data'])
+        && is_array($entry['data']) && (time() - (int) $entry['at']) >= 0 && (time() - (int) $entry['at']) < $seconds;
     $previous = esmCacheRead($key);
-    if ($previous !== null && isset($previous['at'], $previous['data'])
-        && (time() - (int) $previous['at']) >= 0
-        && (time() - (int) $previous['at']) < $seconds
-        && is_array($previous['data'])) return $previous['data'];
-    $data = $collector();
-    if (is_array($data)) esmCacheWrite($key, ['at' => time(), 'data' => $data]);
+    if ($fresh($previous)) return $previous['data'];
+    // Only one request collects at a time. The others reuse the previous result instead of
+    // collecting again (this also keeps CPU percentages, which compare two samples, consistent).
+    $dir = esmCacheDirectory();
+    $lock = $dir !== null ? @fopen($dir . '/' . $key . '.lock', 'c') : false;
+    if ($lock !== false) {
+        if (!@flock($lock, LOCK_EX | LOCK_NB)) {
+            if ($previous !== null && is_array($previous['data'] ?? null)) { fclose($lock); return $previous['data']; }
+            @flock($lock, LOCK_EX); // nothing to serve yet: wait for the running collection
+        }
+        $again = esmCacheRead($key);
+        if ($fresh($again)) { @flock($lock, LOCK_UN); fclose($lock); return $again['data']; }
+    }
+    try {
+        $data = $collector();
+        if (is_array($data)) esmCacheWrite($key, ['at' => time(), 'data' => $data]);
+    } finally {
+        if ($lock !== false) { @flock($lock, LOCK_UN); @fclose($lock); }
+    }
     return is_array($data) ? $data : [];
 }
 
@@ -424,8 +464,9 @@ function esmDisks(): array
             $free = (int) $free;
             $dev = $stat !== false ? (string) $stat['dev'] : null;
         }
-        $key = ($dev ?? ($device . '|' . $type))
-            . '|' . $total . '|' . $free;
+        // Same filesystem id = same filesystem (bind mounts...). Free space is not part of the key:
+        // it can change between two measurements of the same filesystem.
+        $key = $dev !== null ? 'dev:' . $dev . '|' . $total : $device . '|' . $type . '|' . $total . '|' . $free;
         if (!isset($groups[$key])) {
             if (count($groups) >= ESM_MAX_MOUNTS) {
                 continue;
@@ -745,7 +786,7 @@ function esmPciName(string $vendor, string $device, string $root = ''): ?string
                 }
             }
             fclose($handle);
-            return ['name' => $name];
+            if ($name !== null) return ['name' => $name];
         }
         return ['name' => null];
     };
@@ -870,6 +911,13 @@ function esmCheckReboot(string $root = '', ?string $running = null): array
     foreach (glob($root . '/lib/modules/*', GLOB_ONLYDIR) ?: [] as $dir) {
         if (@is_file($dir . '/modules.dep') || @is_dir($dir . '/kernel')) $installed[] = basename($dir);
     }
+    // Where kernel images are versioned (/boot/vmlinuz-<version>), only count kernels whose image exists.
+    $images = glob($root . '/boot/vmlinuz-*') ?: [];
+    $imageVersions = array_map(static fn(string $file): string => substr(basename($file), 8), $images);
+    if (array_intersect($imageVersions, $installed)) {
+        $installed = array_values(array_filter($installed, static fn(string $version): bool =>
+            in_array($version, $imageVersions, true) || @is_file($root . '/lib/modules/' . $version . '/vmlinuz')));
+    }
     usort($installed, 'version_compare');
     $latest = $installed ? end($installed) : null;
     if ($latest !== null && $running !== '' && version_compare($latest, $running, '>')) $reasons[] = 'kernel';
@@ -935,6 +983,19 @@ function esmListeningPorts(): array
     return esmCachedCollect('ports', 10, static fn(): array => esmParseListeningPorts(
         esmRead('/proc/net/tcp', 4194304), esmRead('/proc/net/tcp6', 4194304)));
 }
+function esmIsPublicIp(string $ip): bool
+{
+    if (str_starts_with($ip, '::ffff:')) $ip = substr($ip, 7);
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return false;
+        $long = ip2long($ip);
+        return !($long >= ip2long('100.64.0.0') && $long <= ip2long('100.127.255.255')); // CGNAT, Tailscale
+    }
+    $binary = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? @inet_pton($ip) : false;
+    if (!is_string($binary) || strlen($binary) !== 16) return false;
+    $first = ord($binary[0]);
+    return ($first & 0xE0) === 0x20; // global unicast 2000::/3 (excludes ::1, fe80::/10, fc00::/7)
+}
 function esmParseListeningPorts(?string ...$tables): array
 {
     $sensitive = [1433, 2375, 3306, 5432, 5984, 6379, 8086, 9042, 9200, 11211, 27017];
@@ -963,7 +1024,8 @@ function esmParseListeningPorts(?string ...$tables): array
             continue; // listening everywhere already covers loopback and specific addresses
         }
         foreach (array_keys($scopes['address'] ?? []) as $address) {
-            $out[] = ['port' => $port, 'scope' => 'address', 'address' => $address, 'service' => $name, 'sensitive' => false];
+            $out[] = ['port' => $port, 'scope' => 'address', 'address' => $address, 'service' => $name,
+                'sensitive' => in_array($port, $sensitive, true) && esmIsPublicIp($address)];
         }
         if (isset($scopes['local'])) $out[] = ['port' => $port, 'scope' => 'local', 'address' => null, 'service' => $name, 'sensitive' => false];
     }
@@ -1081,7 +1143,15 @@ function esmSampleProcesses(): array
     usort($cpuSorted, static fn($a, $b): int => ($b['cpuPercent'] ?? -1) <=> ($a['cpuPercent'] ?? -1));
     $ramSorted = $records;
     usort($ramSorted, static fn($a, $b): int => $b['rssPages'] <=> $a['rssPages']);
+    $keep = max(5, min(50, ESM_PROCESS_DETAIL_LIMIT));
+    $memory = esmMemInfo();
+    $swapInUse = ($memory['SwapTotal'] ?? 0) > 0 && ($memory['SwapTotal'] ?? 0) - ($memory['SwapFree'] ?? 0) > 0;
+    // The status file is the only source of per-process swap, so it is read for every process
+    // when swap is in use; otherwise only for the processes that can be listed.
+    $candidates = $swapInUse ? null
+        : array_flip(array_column(array_merge(array_slice($cpuSorted, 0, $keep), array_slice($ramSorted, 0, $keep)), 'id'));
     foreach ($records as &$rec) {
+        if ($candidates !== null && !isset($candidates[$rec['id']])) { $rec['swapBytes'] = null; $rec['rssBytes'] = null; continue; }
         $status = esmRead('/proc/' . $rec['pid'] . '/status', 16384);
         $rec['swapBytes'] = ($status !== null && preg_match('/^VmSwap:\s+(\d+)\s+kB/m', $status, $m))
             ? (float) $m[1] * 1024 : null;
@@ -1093,7 +1163,6 @@ function esmSampleProcesses(): array
     usort($swapSorted, static fn($a, $b): int => $b['swapBytes'] <=> $a['swapBytes']);
     $selected = [];
     $recordById = array_column($records, null, 'id');
-    $keep = max(5, min(50, ESM_PROCESS_DETAIL_LIMIT));
     foreach (array_merge(array_slice($cpuSorted, 0, $keep), array_slice($ramSorted, 0, $keep), array_slice($swapSorted, 0, $keep)) as $rec) {
         $selected[$rec['id']] = $recordById[$rec['id']];
     }
@@ -1165,7 +1234,7 @@ function esmHttpChecks(): array
         $cached = $saved[$key] ?? null;
         $fresh = is_array($cached) && isset($cached['checkedAt'])
             && time() - (int) $cached['checkedAt'] >= 0
-            && time() - (int) $cached['checkedAt'] < ESM_HTTP_CACHE_SECONDS;
+            && time() - (int) $cached['checkedAt'] < (!empty($cached['online']) ? ESM_HTTP_CACHE_SECONDS : ESM_HTTP_RETRY_SECONDS);
         if ($fresh) {
             $results[] = $cached;
         } elseif ($probed < ESM_HTTP_PROBES_PER_REQUEST) {
@@ -1223,17 +1292,38 @@ function esmHttpProbe(array $item): ?array
     ]];
     $context = stream_context_create($options);
     $start = microtime(true);
-    $client = @stream_socket_client(
-        ($tls ? 'tls://' : 'tcp://') . $endpoint,
-        $errno, $errorString, 0.55, STREAM_CLIENT_CONNECT, $context
-    );
-    if (!is_resource($client)) return $result;
-    $request = "GET " . $path . " HTTP/1.1\r\nHost: " . $hostname
-        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/1.2.0\r\nAccept: */*\r\n\r\n";
+    $messages = [];
+    set_error_handler(static function (int $level, string $message) use (&$messages): bool {
+        $messages[] = $message;
+        return true;
+    });
+    try {
+        $client = @stream_socket_client(
+            ($tls ? 'tls://' : 'tcp://') . $endpoint,
+            $errno, $errorString, max(0.2, ESM_HTTP_TIMEOUT_SECONDS / 2), STREAM_CLIENT_CONNECT, $context
+        );
+    } finally {
+        restore_error_handler();
+    }
+    if (!is_resource($client)) {
+        // Name the cause only when it is certain; otherwise keep the generic message.
+        $details = $errorString . "\n" . implode("\n", $messages);
+        if ($tls && preg_match('/certificate verify failed|did not match expected CN|peer certificate/i', $details)) {
+            $result['error'] = 'tlsCertificateError';
+        } elseif ($errno === 111 || stripos($errorString, 'refused') !== false) {
+            $result['error'] = 'connectionRefused';
+        } elseif ($errno === 110 || stripos($errorString, 'timed out') !== false) {
+            $result['error'] = 'httpTimeout';
+        }
+        return $result;
+    }
+    $defaultPort = $tls ? 443 : 80;
+    $request = "GET " . $path . " HTTP/1.1\r\nHost: " . $hostname . ($port !== $defaultPort ? ':' . $port : '')
+        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/1.2.1\r\nAccept: */*\r\n\r\n";
     stream_set_blocking($client, false);
     $pending = $request;
     $headers = '';
-    $deadline = microtime(true) + 0.65;
+    $deadline = microtime(true) + max(0.2, ESM_HTTP_TIMEOUT_SECONDS - (microtime(true) - $start));
     while (microtime(true) < $deadline && strlen($headers) < 8192) {
         $wantRead = $pending === '' ? [$client] : null;
         $wantWrite = $pending !== '' ? [$client] : null;
@@ -1271,7 +1361,9 @@ function esmHttpProbe(array $item): ?array
             $result['error'] = 'selfProbeMismatch';
         }
     } else {
-        $result['error'] = 'invalidResponse';
+        $complete = str_contains($headers, "\r\n\r\n") || str_contains($headers, "\n\n");
+        $result['reachable'] = $headers !== '';
+        $result['error'] = ($headers === '' && !$complete && microtime(true) >= $deadline) ? 'httpTimeout' : 'invalidResponse';
     }
     if ($tls && function_exists('openssl_x509_parse')) {
         $params = @stream_context_get_params($client);
@@ -1317,7 +1409,7 @@ if (isset($_GET['api'])) {
         $payload = [
             'ok' => true,
             'view' => $apiView,
-            'version' => '1.2.0',
+            'version' => '1.2.1',
             'sampleTimeMs' => round(microtime(true) * 1000),
             'system' => esmSafeCollect('system', 'esmSystem', []),
             'cpu' => esmSafeCollect('cpu', 'esmCpu', ['total'=>null, 'idle'=>null, 'cores'=>[]]),
@@ -1840,7 +1932,7 @@ button.control:active { transform:translateY(1px); }
 [data-style="pro"] .panel h2 {border-bottom:1px solid var(--border);padding-bottom:10px;}
 [data-style="pro"] .metric:hover {transform:none;box-shadow:none;}
 
-/* "Dim": the night style, lightened */
+/* "Dusk": the night style, lightened */
 [data-style="zen"] body {background-image:linear-gradient(180deg,#30455e 0%,var(--bg) 440px);background-attachment:fixed;}
 [data-style="zen"] .header {border-radius:13px;background:#33495f;border:1px solid #5a7390;}
 [data-style="zen"] .metric,[data-style="zen"] .panel {border-radius:12px;}
@@ -1946,7 +2038,7 @@ html:not([data-view="overview"]) .summary { display:none !important; }
           <option value="hi">हिन्दी</option>
           <option value="ja">日本語</option>
         </select>
-        <label class="style-picker"><span data-i18n="interfaceStyle">Style</span><select class="control" id="styleChoice" aria-label="Interface style"><option value="operations" data-i18n="styleNight">Night</option><option value="zen" data-i18n="styleDim">Dim</option><option value="pro" data-i18n="styleLight">Light</option></select></label>
+        <label class="style-picker"><span data-i18n="interfaceStyle">Style</span><select class="control" id="styleChoice" aria-label="Interface style"><option value="operations" data-i18n="styleNight">Night</option><option value="zen" data-i18n="styleDim">Dusk</option><option value="pro" data-i18n="styleLight">Light</option></select></label>
         <button type="button" class="control" id="settings" aria-label="Settings" title="Settings">⚙</button>
         <button type="button" class="control" id="refresh" aria-label="Refresh" title="Refresh">↻</button>
       </div>
@@ -2173,7 +2265,7 @@ html:not([data-view="overview"]) .summary { display:none !important; }
       <div class="help-cluster"><button type="button" class="help-button" data-help="historyNote" aria-label="Help">?</button></div>
     </dialog>
 
-    <footer class="foot">Monitor made Simple 1.2.0 · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
+    <footer class="foot">Monitor made Simple 1.2.1 · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
     <footer class="site-footer" id="siteFooter" aria-label="Source code and support">
       <span class="footer-text" data-i18n="footerSource">Source code and support:</span>
       <a href="https://github.com/Fabrice-breizh" target="_blank" rel="noopener noreferrer">GitHub</a>
@@ -2242,6 +2334,10 @@ const words = {
     "moveUp": "Move up",
     "moveDown": "Move down",
     "resetSettings": "Reset preferences",
+    "connectionRefused": "Connection refused (nothing is listening on this port)",
+    "httpTimeout": "No answer in time (timeout)",
+    "tlsCertificateError": "TLS certificate rejected (expired, self-signed or wrong name)",
+    "healthPublicPort": "listening on the public address",
     "viewOverview": "Overview",
     "viewSystem": "System",
     "viewNetwork": "Network",
@@ -2270,7 +2366,7 @@ const words = {
     "healthExposedPort": "listening on all interfaces",
     "yes": "Yes",
     "styleNight": "Night",
-    "styleDim": "Dim",
+    "styleDim": "Dusk",
     "styleLight": "Light",
     "physicalCores": "Physical cores",
     "tempCpu": "CPU temperature",
@@ -2452,6 +2548,10 @@ const words = {
     "moveUp": "Monter",
     "moveDown": "Descendre",
     "resetSettings": "Réinitialiser les préférences",
+    "connectionRefused": "Connexion refusée (aucun service n'écoute sur ce port)",
+    "httpTimeout": "Pas de réponse à temps (délai dépassé)",
+    "tlsCertificateError": "Certificat TLS refusé (expiré, auto-signé ou nom incorrect)",
+    "healthPublicPort": "en écoute sur l'adresse publique",
     "viewOverview": "Vue d'ensemble",
     "viewSystem": "Système",
     "viewNetwork": "Réseau",
@@ -2480,7 +2580,7 @@ const words = {
     "healthExposedPort": "en écoute sur toutes les interfaces",
     "yes": "Oui",
     "styleNight": "Nuit",
-    "styleDim": "Intermédiaire",
+    "styleDim": "Crépuscule",
     "styleLight": "Clair",
     "physicalCores": "Cœurs physiques",
     "tempCpu": "Température CPU",
@@ -2662,6 +2762,10 @@ const words = {
     "moveUp": "Subir",
     "moveDown": "Bajar",
     "resetSettings": "Restablecer preferencias",
+    "connectionRefused": "Conexión rechazada (ningún servicio escucha en este puerto)",
+    "httpTimeout": "Sin respuesta a tiempo (tiempo de espera agotado)",
+    "tlsCertificateError": "Certificado TLS rechazado (caducado, autofirmado o nombre incorrecto)",
+    "healthPublicPort": "en escucha en la dirección pública",
     "viewOverview": "Resumen",
     "viewSystem": "Sistema",
     "viewNetwork": "Red",
@@ -2690,7 +2794,7 @@ const words = {
     "healthExposedPort": "en escucha en todas las interfaces",
     "yes": "Sí",
     "styleNight": "Noche",
-    "styleDim": "Intermedio",
+    "styleDim": "Crepúsculo",
     "styleLight": "Claro",
     "physicalCores": "Núcleos físicos",
     "tempCpu": "Temperatura CPU",
@@ -2872,6 +2976,10 @@ const words = {
     "moveUp": "上移",
     "moveDown": "下移",
     "resetSettings": "恢复默认设置",
+    "connectionRefused": "连接被拒绝（此端口没有服务在监听）",
+    "httpTimeout": "未及时响应（超时）",
+    "tlsCertificateError": "TLS 证书被拒绝（已过期、自签名或名称不符）",
+    "healthPublicPort": "正在公网地址上监听",
     "viewOverview": "概览",
     "viewSystem": "系统",
     "viewNetwork": "网络",
@@ -2900,7 +3008,7 @@ const words = {
     "healthExposedPort": "正在所有网络接口上监听",
     "yes": "是",
     "styleNight": "夜间",
-    "styleDim": "柔和",
+    "styleDim": "黄昏",
     "styleLight": "浅色",
     "physicalCores": "物理核心",
     "tempCpu": "CPU 温度",
@@ -3082,6 +3190,10 @@ const words = {
     "moveUp": "ऊपर ले जाएँ",
     "moveDown": "नीचे ले जाएँ",
     "resetSettings": "सेटिंग्स रीसेट करें",
+    "connectionRefused": "कनेक्शन अस्वीकृत (इस पोर्ट पर कोई सेवा नहीं सुन रही)",
+    "httpTimeout": "समय पर उत्तर नहीं (टाइमआउट)",
+    "tlsCertificateError": "TLS प्रमाणपत्र अस्वीकृत (समाप्त, स्व-हस्ताक्षरित या गलत नाम)",
+    "healthPublicPort": "सार्वजनिक पते पर सुन रहा है",
     "viewOverview": "सारांश",
     "viewSystem": "सिस्टम",
     "viewNetwork": "नेटवर्क",
@@ -3110,7 +3222,7 @@ const words = {
     "healthExposedPort": "सभी इंटरफ़ेस पर सुन रहा है",
     "yes": "हाँ",
     "styleNight": "रात",
-    "styleDim": "मध्यम",
+    "styleDim": "संध्या",
     "styleLight": "हल्का",
     "physicalCores": "भौतिक कोर",
     "tempCpu": "CPU तापमान",
@@ -3292,6 +3404,10 @@ const words = {
     "moveUp": "上へ",
     "moveDown": "下へ",
     "resetSettings": "設定を初期化",
+    "connectionRefused": "接続が拒否されました（このポートで待ち受けているサービスがありません）",
+    "httpTimeout": "時間内に応答がありません（タイムアウト）",
+    "tlsCertificateError": "TLS 証明書が拒否されました（期限切れ、自己署名、または名前の不一致）",
+    "healthPublicPort": "パブリックアドレスで待ち受け中",
     "viewOverview": "概要",
     "viewSystem": "システム",
     "viewNetwork": "ネットワーク",
@@ -3320,7 +3436,7 @@ const words = {
     "healthExposedPort": "すべてのインターフェースで待ち受け中",
     "yes": "はい",
     "styleNight": "ナイト",
-    "styleDim": "ミディアム",
+    "styleDim": "トワイライト",
     "styleLight": "ライト",
     "physicalCores": "物理コア",
     "tempCpu": "CPU 温度",
@@ -4021,7 +4137,8 @@ function renderHealth(data) {
   const failedUnits = data.failedUnits?.units || [];
   if (failedUnits.length) add(1, `${t('healthFailedUnits')}${localeColon()}${failedUnits.slice(0,3).map(unit => unit.unit).join(', ')}${failedUnits.length > 3 ? '…' : ''}`, 'system');
   for (const entry of (data.ports || []).filter(port => port.sensitive)) {
-    add(1, `${entry.service || entry.port} (${entry.port}) ${t('healthExposedPort')}`, 'network');
+    const where = entry.scope === 'all' ? t('healthExposedPort') : `${t('healthPublicPort')} ${entry.address}`;
+    add(1, `${entry.service || entry.port} (${entry.port}) ${where}`, 'network');
   }
   const swapping = Math.max(0, state.rates.swapIn || 0) + Math.max(0, state.rates.swapOut || 0);
   if (swapping >= 100) add(2,`${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`, 'processes');
@@ -4692,9 +4809,18 @@ async function poll() {
   if (state.busy || !state.active) { if (state.busy) state.repoll = true; return; }
   state.busy = true;
   try {
-    const response = await fetch(location.pathname + '?api=stats&view=' + encodeURIComponent(currentView), {
-      cache: 'no-store', credentials: 'same-origin',
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(8000, refreshSeconds * 2000));
+    let response;
+    try {
+      response = await fetch(location.pathname + '?api=stats&view=' + encodeURIComponent(currentView), {
+        cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
+      });
+    } catch (error) {
+      throw error?.name === 'AbortError' ? new Error('timeout') : error;
+    } finally {
+      clearTimeout(timer);
+    }
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const data = await response.json();
     if (!data.ok) throw new Error('API error');
