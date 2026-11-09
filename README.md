@@ -1,6 +1,10 @@
+<img src="assets/monitor.png" alt="Monitor made Simple icon" width="96" align="left">
+
 # Monitor made Simple
 
 **A lightweight Linux monitoring dashboard in a single PHP file.** No database, no agent, no external assets, no dependencies: drop `monitor.php` on your web server, set a password, and open it in your browser.
+
+<br clear="left">
 
 <img src="screenshots/monitor_made_simple.png" alt="Monitor made Simple dashboard" width="900">
 
