@@ -1,6 +1,6 @@
 <?php
 /**
- * Monitor made Simple 1.0.3 — single-file Linux monitoring dashboard.
+ * Monitor made Simple 1.2.0 — single-file Linux monitoring dashboard.
  * PHP 8.1+, no external assets or database.
  * HTTP Basic authentication is mandatory for the page and JSON API.
  */
@@ -15,7 +15,7 @@ const ESM_AUTH_USER = 'admin';
 
 // Set a password hash via the ESM_PASSWORD_HASH environment variable (recommended),
 // or paste a password_hash() result below. Never store a plaintext password here.
-const ESM_PASSWORD_HASH = '';
+const ESM_PASSWORD_HASH = 'GENERATE_ME';
 // No hash means HTTP 401 for every request, including the JSON API.
 // Never bypass authentication based on REMOTE_ADDR: reverse proxies may use loopback.
 
@@ -27,11 +27,15 @@ const ESM_SERVICES = [
 const ESM_MAX_MOUNTS = 24;
 const ESM_MAX_DISK_DEVICES = 24;
 const ESM_MAX_PROCESSES = 5000;
+const ESM_PROCESS_DETAIL_LIMIT = 20; // processes per list on the detail page (?view=processes)
 const ESM_PROCESS_CACHE_SECONDS = 10;
 const ESM_SERVICES_CACHE_SECONDS = 12;
 const ESM_INODES_CACHE_SECONDS = 45;
 const ESM_REMOTE_MOUNT_CACHE_SECONDS = 60;
 const ESM_HTTP_CACHE_SECONDS = 60;
+const ESM_GPU_CACHE_SECONDS = 10;
+const ESM_SYSTEMD_CACHE_SECONDS = 60;
+const ESM_REBOOT_CACHE_SECONDS = 120;
 const ESM_HTTP_PROBES_PER_REQUEST = 1;
 const ESM_MONITOR_REMOTE_MOUNTS = false;
 // Keep remote mounts disabled by default; explicitly allow only trusted paths.
@@ -65,7 +69,7 @@ function esmNonce(): string
 }
 
 header('X-Content-Type-Options: nosniff');
-header('X-Monitor-Made-Simple: 1.0.3');
+header('X-Monitor-Made-Simple: 1.2.0');
 header('Referrer-Policy: no-referrer');
 header('X-Frame-Options: DENY');
 header('Cache-Control: private, no-store, max-age=0');
@@ -207,6 +211,23 @@ function esmMemInfo(): array
 // =============================================================
 // 04. SYSTEM AND CPU IDENTIFICATION
 // =============================================================
+function esmCpuTopology(?string $contents): array
+{
+    static $cache = [];
+    $key = md5((string) $contents);
+    if (isset($cache[$key])) return $cache[$key];
+    $sockets = []; $cores = [];
+    foreach (preg_split('/\n\s*\n/', (string) $contents) ?: [] as $block) {
+        $socket = preg_match('/^physical id\s*:\s*(\d+)/mi', $block, $m) ? $m[1] : null;
+        $core = preg_match('/^core id\s*:\s*(\d+)/mi', $block, $n) ? $n[1] : null;
+        if ($socket !== null) $sockets[$socket] = true;
+        if ($socket !== null && $core !== null) $cores[$socket . ':' . $core] = true;
+    }
+    return $cache[$key] = [
+        'sockets' => $sockets ? count($sockets) : null,
+        'cores' => $cores ? count($cores) : null,
+    ];
+}
 function esmCpuModel(?string $contents): ?string
 {
     if ($contents === null) {
@@ -255,6 +276,8 @@ function esmSystem(): array
         'uptimeSeconds' => $uptime,
         'cpuModel' => esmCpuModel($cpuInfo),
         'logicalCores' => $cores !== false && $cores > 0 ? $cores : null,
+        'cpuSockets' => esmCpuTopology($cpuInfo)['sockets'],
+        'physicalCores' => esmCpuTopology($cpuInfo)['cores'],
         'load' => is_array($load) ? array_map('floatval', $load) : null,
         'time' => date(DATE_ATOM),
     ];
@@ -442,6 +465,42 @@ function esmDisks(): array
     return array_slice($out, 0, ESM_MAX_MOUNTS);
 }
 
+// Runs a fixed command (never built from the request) with a hard timeout and output cap.
+function esmRunCommand(array $command, float $timeout, int $maxBytes): ?string
+{
+    if (!function_exists('proc_open')) return null;
+    $spec = [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']];
+    $proc = @proc_open($command, $spec, $pipes);
+    if (!is_resource($proc)) return null;
+    stream_set_blocking($pipes[1], false);
+    $text = '';
+    $deadline = microtime(true) + $timeout;
+    $timedOut = false;
+    while (true) {
+        $remaining = $deadline - microtime(true);
+        if ($remaining <= 0) { $timedOut = true; break; }
+        $reads = [$pipes[1]]; $writes = null; $except = null;
+        @stream_select($reads, $writes, $except, 0, min(150000, (int) ($remaining * 1000000)));
+        if ($reads) {
+            $chunk = @fread($pipes[1], 8192);
+            if (is_string($chunk)) $text .= $chunk;
+            if (strlen($text) > $maxBytes) { $timedOut = true; break; }
+        }
+        if (feof($pipes[1])) break;
+        $status = @proc_get_status($proc);
+        if (is_array($status) && !$status['running'] && !$reads) break;
+    }
+    if ($timedOut) {
+        @proc_terminate($proc);
+        usleep(20000);
+        $status = @proc_get_status($proc);
+        if (is_array($status) && $status['running']) @proc_terminate($proc, 9);
+    }
+    fclose($pipes[1]);
+    @proc_close($proc);
+    return $timedOut ? null : $text;
+}
+
 // =============================================================
 // 08. INODE METRICS
 // =============================================================
@@ -451,36 +510,8 @@ function esmInodes(): array
         $binary = is_executable('/usr/bin/df') ? '/usr/bin/df'
             : (is_executable('/bin/df') ? '/bin/df' : null);
         if ($binary === null || !function_exists('proc_open')) return [];
-        $spec = [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']];
-        $proc = @proc_open([$binary, '-Pi', '-l'], $spec, $pipes);
-        if (!is_resource($proc)) return [];
-        stream_set_blocking($pipes[1], false);
-        $text = '';
-        $deadline = microtime(true) + 0.9;
-        $timedOut = false;
-        while (true) {
-            $remaining = $deadline - microtime(true);
-            if ($remaining <= 0) { $timedOut = true; break; }
-            $reads = [$pipes[1]]; $writes = null; $except = null;
-            @stream_select($reads, $writes, $except, 0, min(150000, (int) ($remaining * 1000000)));
-            if ($reads) {
-                $chunk = @fread($pipes[1], 8192);
-                if (is_string($chunk)) $text .= $chunk;
-                if (strlen($text) > 131072) { $timedOut = true; break; }
-            }
-            if (feof($pipes[1])) break;
-            $status = @proc_get_status($proc);
-            if (is_array($status) && !$status['running'] && !$reads) break;
-        }
-        if ($timedOut) {
-            @proc_terminate($proc);
-            usleep(20000);
-            $status = @proc_get_status($proc);
-            if (is_array($status) && $status['running']) @proc_terminate($proc, 9);
-        }
-        fclose($pipes[1]);
-        @proc_close($proc);
-        if ($timedOut) return [];
+        $text = esmRunCommand([$binary, '-Pi', '-l'], 0.9, 131072);
+        if ($text === null) return [];
         $out = [];
         foreach (explode("\n", $text) as $line) {
             if (!preg_match('/^\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+(.+)$/', trim($line), $m)) continue;
@@ -616,32 +647,327 @@ function esmPressure(): array
 // =============================================================
 // 11. HARDWARE SENSORS
 // =============================================================
-function esmTemperatures(): array
+function esmTemperatures(string $root = ''): array
 {
     if (!function_exists('glob')) return [];
-    $out = [];
-    foreach (glob('/sys/class/thermal/thermal_zone*/temp') ?: [] as $path) {
-        $n = esmNumber(esmRead($path, 64));
-        if ($n === null) continue;
-        $c = abs($n) >= 1000 ? $n / 1000 : $n;
-        if ($c < -40 || $c > 130) continue;
-        $label = esmRead(dirname($path) . '/type', 128);
-        $out[] = ['name' => trim($label ?? 'Thermal'), 'celsius' => round($c, 1)];
+    $cpu = [];
+    $other = [];
+    $chips = glob($root . '/sys/class/hwmon/hwmon*', GLOB_ONLYDIR) ?: [];
+    natsort($chips);
+    foreach ($chips as $dir) {
+        $chip = strtolower(trim((string) esmRead($dir . '/name', 128)));
+        if (in_array($chip, ['amdgpu', 'radeon', 'nouveau', 'i915', 'xe'], true)) continue; // shown with the GPU
+        $sensors = [];
+        foreach (glob($dir . '/temp*_input') ?: [] as $path) {
+            $value = esmNumber(esmRead($path, 64));
+            if ($value === null) continue;
+            $celsius = $value / 1000;
+            if ($celsius < -40 || $celsius > 130) continue;
+            $label = trim((string) esmRead(substr($path, 0, -6) . '_label', 128));
+            $sensors[] = ['label' => $label, 'celsius' => $celsius];
+        }
+        if (!$sensors) continue;
+        $hottest = max(array_column($sensors, 'celsius'));
+        $pick = static function (string $pattern) use ($sensors): ?float {
+            foreach ($sensors as $sensor) if (preg_match($pattern, $sensor['label'])) return $sensor['celsius'];
+            return null;
+        };
+        if (in_array($chip, ['coretemp', 'k10temp', 'zenpower', 'cpu_thermal', 'cpu-thermal', 'soc_thermal', 'scpi_sensors'], true)) {
+            // One value per processor package: the package sensor if there is one, else the hottest core.
+            $value = $pick('/^(package id|tdie)/i') ?? $pick('/^tctl/i') ?? $hottest;
+            $cpu[] = ['kind' => 'cpu', 'celsius' => round($value, 1)];
+            continue;
+        }
+        $link = @readlink($dir . '/device');
+        $device = is_string($link) ? basename($link) : '';
+        $kind = match (true) {
+            in_array($chip, ['nvme', 'drivetemp'], true) => 'disk',
+            $chip === 'acpitz' => 'board',
+            str_starts_with($chip, 'pch_') => 'chipset',
+            str_starts_with($chip, 'iwlwifi') || str_starts_with($chip, 'mt7') || str_starts_with($chip, 'ath') => 'wifi',
+            default => 'other',
+        };
+        $value = $kind === 'disk' ? ($pick('/^composite/i') ?? $hottest) : $hottest;
+        $name = $kind === 'disk' && preg_match('/^(nvme\d+|\d+:\d+:\d+:\d+)$/', $device) ? $device : ($kind === 'other' ? $chip : '');
+        $other[] = ['kind' => $kind, 'name' => mbSafeLimit($name, 40), 'celsius' => round($value, 1)];
     }
-    foreach (glob('/sys/class/hwmon/hwmon*/temp*_input') ?: [] as $path) {
-        $n = esmNumber(esmRead($path, 64));
-        if ($n === null) continue;
-        $c = $n / 1000;
-        if ($c < -40 || $c > 130) continue;
-        $labelPath = preg_replace('/_input$/', '_label', $path);
-        $label = $labelPath ? esmRead($labelPath, 128) : null;
-        $chip = esmRead(dirname($path) . '/name', 128);
-        $out[] = [
-            'name' => trim(($chip ?? 'Sensor') . ' ' . ($label ?? basename($path))),
-            'celsius' => round($c, 1),
+    if (!$cpu && !$other) {
+        // No hwmon (some ARM boards, containers): fall back to thermal zones.
+        $zones = glob($root . '/sys/class/thermal/thermal_zone*', GLOB_ONLYDIR) ?: [];
+        natsort($zones);
+        foreach ($zones as $zone) {
+            $value = esmNumber(esmRead($zone . '/temp', 64));
+            if ($value === null) continue;
+            $celsius = abs($value) >= 1000 ? $value / 1000 : $value;
+            if ($celsius < -40 || $celsius > 130) continue;
+            $type = strtolower(trim((string) esmRead($zone . '/type', 128)));
+            if (preg_match('/^(x86_pkg_temp|cpu|soc)/', $type)) $cpu[] = ['kind' => 'cpu', 'celsius' => round($celsius, 1)];
+            else $other[] = ['kind' => $type === 'acpitz' ? 'board' : 'other', 'name' => mbSafeLimit($type, 40), 'celsius' => round($celsius, 1)];
+        }
+    }
+    foreach ($cpu as $index => &$entry) $entry['index'] = $index;
+    unset($entry);
+    return array_slice(array_merge($cpu, $other), 0, 16);
+}
+
+// =============================================================
+// 11b. GRAPHICS CARDS (sysfs; nvidia-smi for the NVIDIA driver)
+// =============================================================
+function esmGpus(): array
+{
+    return esmCachedCollect('gpus', ESM_GPU_CACHE_SECONDS, static fn(): array => esmCollectGpus());
+}
+function esmGpuVendor(string $id): ?string
+{
+    return [
+        '0x10de' => 'NVIDIA', '0x1002' => 'AMD', '0x8086' => 'Intel', '0x1a03' => 'ASPEED',
+        '0x102b' => 'Matrox', '0x15ad' => 'VMware', '0x1af4' => 'Virtio', '0x1234' => 'QEMU',
+        '0x1414' => 'Microsoft', '0x80ee' => 'VirtualBox', '0x5143' => 'Qualcomm', '0x14e4' => 'Broadcom',
+    ][$id] ?? null;
+}
+function esmPciName(string $vendor, string $device, string $root = ''): ?string
+{
+    if (!preg_match('/^0x([0-9a-f]{4})$/', $vendor, $v) || !preg_match('/^0x([0-9a-f]{4})$/', $device, $d)) return null;
+    $lookup = static function () use ($v, $d, $root): array {
+        foreach ([$root . '/usr/share/misc/pci.ids', $root . '/usr/share/hwdata/pci.ids', $root . '/usr/share/pci.ids'] as $file) {
+            $handle = @fopen($file, 'rb');
+            if ($handle === false) continue;
+            $inVendor = false;
+            $name = null;
+            while (($line = fgets($handle, 512)) !== false) {
+                if ($line === '' || $line[0] === '#') continue;
+                if ($line[0] !== "\t") {
+                    if ($inVendor) break;
+                    $inVendor = strncasecmp($line, $v[1] . '  ', 6) === 0;
+                } elseif ($inVendor && $line[1] !== "\t" && strncasecmp(substr($line, 1), $d[1] . '  ', 6) === 0) {
+                    $name = trim(substr($line, 7));
+                    break;
+                }
+            }
+            fclose($handle);
+            return ['name' => $name];
+        }
+        return ['name' => null];
+    };
+    $result = $root === '' ? esmCachedCollect('pci-' . $v[1] . '-' . $d[1], 86400, $lookup) : $lookup();
+    return isset($result['name']) && is_string($result['name']) ? mbSafeLimit($result['name'], 100) : null;
+}
+function esmNvidiaSmi(): array
+{
+    $binary = null;
+    foreach (['/usr/bin/nvidia-smi', '/usr/local/bin/nvidia-smi'] as $candidate) {
+        if (@is_executable($candidate)) { $binary = $candidate; break; }
+    }
+    if ($binary === null) return [];
+    $text = esmRunCommand([$binary,
+        '--query-gpu=pci.bus_id,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm,clocks.max.sm',
+        '--format=csv,noheader,nounits'], 2.0, 65536);
+    if ($text === null) return [];
+    $value = static fn(string $field): ?float => is_numeric(trim($field)) ? (float) trim($field) : null;
+    $out = [];
+    foreach (explode("\n", trim($text)) as $line) {
+        $f = array_map('trim', explode(',', $line));
+        if (count($f) < 9) continue;
+        $out[strtolower(substr($f[0], -12))] = [
+            'name' => mbSafeLimit($f[1], 100),
+            'busyPercent' => $value($f[2]),
+            'vramUsed' => ($m = $value($f[3])) !== null ? $m * 1048576 : null,
+            'vramTotal' => ($m = $value($f[4])) !== null ? $m * 1048576 : null,
+            'celsius' => $value($f[5]),
+            'watts' => $value($f[6]),
+            'mhz' => $value($f[7]),
+            'maxMhz' => $value($f[8]),
         ];
     }
-    return array_slice($out, 0, 24);
+    return $out;
+}
+function esmCollectGpus(string $root = ''): array
+{
+    if (!function_exists('glob')) return [];
+    $cards = glob($root . '/sys/class/drm/card*', GLOB_ONLYDIR) ?: [];
+    natsort($cards);
+    $out = [];
+    $seen = [];
+    $hasNvidia = false;
+    foreach ($cards as $card) {
+        if (!preg_match('#/card\d+$#', $card)) continue; // skip connectors such as card0-HDMI-A-1
+        $dev = $card . '/device';
+        $real = @realpath($dev) ?: $dev;
+        if (isset($seen[$real])) continue;
+        $seen[$real] = true;
+        $vendorId = strtolower(trim((string) esmRead($dev . '/vendor', 16)));
+        $deviceId = strtolower(trim((string) esmRead($dev . '/device', 16)));
+        $driverLink = @readlink($dev . '/driver');
+        $driver = is_string($driverLink) ? basename($driverLink) : null;
+        if (in_array($driver, ['simple-framebuffer', 'simpledrm', 'efi-framebuffer', 'vesafb'], true)) continue;
+        $vendor = esmGpuVendor($vendorId);
+        $model = $vendorId !== '' ? esmPciName($vendorId, $deviceId, $root) : null;
+        $name = $model !== null && $vendor !== null && stripos($model, $vendor) === 0
+            ? $model : trim(($vendor ?? '') . ' ' . ($model ?? ''));
+        if ($name === '') $name = $driver ?? basename($card);
+        $number = static fn(string $file): ?float => esmNumber(esmRead($file, 64));
+        $gpu = [
+            'name' => mbSafeLimit($name, 120),
+            'driver' => $driver,
+            'pciId' => $vendorId !== '' ? substr($vendorId, 2) . ':' . substr($deviceId, 2) : null,
+            'busyPercent' => $number($dev . '/gpu_busy_percent'),
+            'vramUsed' => $number($dev . '/mem_info_vram_used'),
+            'vramTotal' => $number($dev . '/mem_info_vram_total'),
+            'celsius' => null, 'watts' => null,
+            'mhz' => $number($card . '/gt_cur_freq_mhz'),
+            'maxMhz' => $number($card . '/gt_max_freq_mhz'),
+        ];
+        foreach (glob($dev . '/hwmon/hwmon*', GLOB_ONLYDIR) ?: [] as $hwmon) {
+            $temp = $number($hwmon . '/temp1_input');
+            if ($temp !== null && $gpu['celsius'] === null) $gpu['celsius'] = round($temp / 1000, 1);
+            $power = $number($hwmon . '/power1_average') ?? $number($hwmon . '/power1_input');
+            if ($power !== null && $gpu['watts'] === null) $gpu['watts'] = round($power / 1000000, 1);
+            $clock = $number($hwmon . '/freq1_input');
+            if ($clock !== null && $gpu['mhz'] === null) $gpu['mhz'] = round($clock / 1000000);
+        }
+        if ($vendorId === '0x10de' && $driver === 'nvidia') {
+            $hasNvidia = true;
+            $gpu['busId'] = strtolower(substr(basename($real), -12));
+        }
+        $out[] = $gpu;
+    }
+    if ($hasNvidia && $root === '') {
+        $smi = esmNvidiaSmi();
+        foreach ($out as &$gpu) {
+            $extra = isset($gpu['busId']) ? ($smi[$gpu['busId']] ?? null) : null;
+            if ($extra) $gpu = array_merge($gpu, array_filter($extra, static fn($v): bool => $v !== null));
+        }
+        unset($gpu);
+    }
+    foreach ($out as &$gpu) unset($gpu['busId']);
+    unset($gpu);
+    return array_slice($out, 0, 8);
+}
+
+// =============================================================
+// 11c. MAINTENANCE: RESTART REQUIRED, FAILED SYSTEMD UNITS, LISTENING PORTS
+// =============================================================
+function esmReboot(): array
+{
+    return esmCachedCollect('reboot', ESM_REBOOT_CACHE_SECONDS, static fn(): array => esmCheckReboot());
+}
+function esmCheckReboot(string $root = '', ?string $running = null): array
+{
+    $reasons = [];
+    $packages = [];
+    foreach ([$root . '/run/reboot-required', $root . '/var/run/reboot-required'] as $file) {
+        if (!@is_file($file)) continue;
+        $reasons[] = 'file';
+        $list = esmRead($file . '.pkgs', 16384);
+        foreach (explode("\n", (string) $list) as $package) {
+            $package = trim($package);
+            if (preg_match('/^[a-zA-Z0-9.+_:-]{1,64}$/', $package)) $packages[$package] = true;
+        }
+        break;
+    }
+    $running ??= function_exists('php_uname') ? php_uname('r') : '';
+    $installed = [];
+    foreach (glob($root . '/lib/modules/*', GLOB_ONLYDIR) ?: [] as $dir) {
+        if (@is_file($dir . '/modules.dep') || @is_dir($dir . '/kernel')) $installed[] = basename($dir);
+    }
+    usort($installed, 'version_compare');
+    $latest = $installed ? end($installed) : null;
+    if ($latest !== null && $running !== '' && version_compare($latest, $running, '>')) $reasons[] = 'kernel';
+    return [
+        'required' => (bool) $reasons,
+        'reasons' => $reasons,
+        'packages' => array_slice(array_keys($packages), 0, 12),
+        'runningKernel' => $running !== '' ? $running : null,
+        'latestKernel' => $latest,
+    ];
+}
+function esmFailedUnits(): array
+{
+    return esmCachedCollect('failed-units', ESM_SYSTEMD_CACHE_SECONDS, static function (): array {
+        $binary = null;
+        foreach (['/usr/bin/systemctl', '/bin/systemctl'] as $candidate) {
+            if (@is_executable($candidate)) { $binary = $candidate; break; }
+        }
+        if ($binary === null) return ['available' => false, 'units' => []];
+        // With its legend, systemctl always prints something when it works ("0 loaded units listed.").
+        $text = esmRunCommand([$binary, 'list-units', '--state=failed', '--all', '--plain', '--no-pager'], 2.0, 131072);
+        return esmParseFailedUnits($text);
+    });
+}
+function esmParseFailedUnits(?string $text): array
+{
+    if ($text === null || trim($text) === '') return ['available' => false, 'units' => []];
+    $units = [];
+    foreach (explode("\n", $text) as $line) {
+        $line = trim(preg_replace('/^[\s\x{25CF}*]+/u', '', $line) ?? $line);
+        if (!preg_match('/^(\S+\.(?:service|socket|mount|automount|timer|path|target|swap|scope|slice|device))\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*)$/', $line, $m)) continue;
+        $units[] = ['unit' => mbSafeLimit($m[1], 120), 'sub' => mbSafeLimit($m[4], 30), 'description' => mbSafeLimit(trim($m[5]), 160)];
+    }
+    return ['available' => true, 'units' => array_slice($units, 0, 30)];
+}
+function esmPortName(int $port): ?string
+{
+    return [
+        21 => 'FTP', 22 => 'SSH', 25 => 'SMTP', 53 => 'DNS', 80 => 'HTTP', 110 => 'POP3', 111 => 'rpcbind', 139 => 'NetBIOS',
+        143 => 'IMAP', 389 => 'LDAP', 443 => 'HTTPS', 445 => 'SMB', 465 => 'SMTPS', 587 => 'SMTP submission', 631 => 'CUPS',
+        636 => 'LDAPS', 853 => 'DNS over TLS', 993 => 'IMAPS', 995 => 'POP3S', 1433 => 'SQL Server', 1883 => 'MQTT',
+        2049 => 'NFS', 2375 => 'Docker API', 2376 => 'Docker API (TLS)', 3000 => 'Gitea / Grafana', 3306 => 'MySQL / MariaDB',
+        3389 => 'RDP', 5432 => 'PostgreSQL', 5900 => 'VNC', 5984 => 'CouchDB', 6379 => 'Redis', 8080 => 'HTTP (alt)',
+        8086 => 'InfluxDB', 8096 => 'Jellyfin', 8443 => 'HTTPS (alt)', 9000 => 'PHP-FPM', 9042 => 'Cassandra',
+        9090 => 'Prometheus / Cockpit', 9091 => 'Transmission', 9100 => 'Node exporter', 9200 => 'Elasticsearch',
+        10050 => 'Zabbix agent', 10051 => 'Zabbix server', 11211 => 'Memcached', 27017 => 'MongoDB', 32400 => 'Plex',
+    ][$port] ?? null;
+}
+function esmProcNetIp(string $hex): ?string
+{
+    if (!ctype_xdigit($hex) || !in_array(strlen($hex), [8, 32], true)) return null;
+    $littleEndian = pack('L', 1) === pack('V', 1);
+    $binary = '';
+    foreach (str_split($hex, 8) as $word) {
+        $bytes = (string) hex2bin($word);
+        $binary .= $littleEndian ? strrev($bytes) : $bytes;
+    }
+    $ip = @inet_ntop($binary);
+    return is_string($ip) ? $ip : null;
+}
+function esmListeningPorts(): array
+{
+    return esmCachedCollect('ports', 10, static fn(): array => esmParseListeningPorts(
+        esmRead('/proc/net/tcp', 4194304), esmRead('/proc/net/tcp6', 4194304)));
+}
+function esmParseListeningPorts(?string ...$tables): array
+{
+    $sensitive = [1433, 2375, 3306, 5432, 5984, 6379, 8086, 9042, 9200, 11211, 27017];
+    $found = [];
+    foreach ($tables as $text) {
+        foreach (explode("\n", (string) $text) as $line) {
+            $f = preg_split('/\s+/', trim($line));
+            if (!$f || count($f) < 4 || $f[3] !== '0A' || !str_contains($f[1], ':')) continue; // 0A = LISTEN
+            [$hexIp, $hexPort] = explode(':', $f[1], 2);
+            if (!ctype_xdigit($hexPort)) continue;
+            $ip = esmProcNetIp($hexIp);
+            if ($ip === null) continue;
+            $port = (int) hexdec($hexPort);
+            $plain = str_starts_with($ip, '::ffff:') ? substr($ip, 7) : $ip;
+            $scope = in_array($plain, ['0.0.0.0', '::'], true) ? 'all'
+                : ((str_starts_with($plain, '127.') || $plain === '::1') ? 'local' : 'address');
+            $found[$port][$scope][$scope === 'address' ? $plain : ''] = true;
+        }
+    }
+    ksort($found);
+    $out = [];
+    foreach ($found as $port => $scopes) {
+        $name = esmPortName((int) $port);
+        if (isset($scopes['all'])) {
+            $out[] = ['port' => $port, 'scope' => 'all', 'address' => null, 'service' => $name, 'sensitive' => in_array($port, $sensitive, true)];
+            continue; // listening everywhere already covers loopback and specific addresses
+        }
+        foreach (array_keys($scopes['address'] ?? []) as $address) {
+            $out[] = ['port' => $port, 'scope' => 'address', 'address' => $address, 'service' => $name, 'sensitive' => false];
+        }
+        if (isset($scopes['local'])) $out[] = ['port' => $port, 'scope' => 'local', 'address' => null, 'service' => $name, 'sensitive' => false];
+    }
+    return array_slice($out, 0, 80);
 }
 
 // =============================================================
@@ -679,7 +1005,23 @@ function esmProbeServices(): array
 // =============================================================
 function esmProcesses(): array
 {
-    return esmCachedCollect('processes-swap-v3', ESM_PROCESS_CACHE_SECONDS, 'esmSampleProcesses');
+    return esmCachedCollect('processes-swap-v4', ESM_PROCESS_CACHE_SECONDS, 'esmSampleProcesses');
+}
+// One shared sample feeds both the dashboard (top 5) and the detail page (top 20):
+// CPU percentages compare two consecutive samples, so a second sampler would skew them.
+function esmProcessTop(array $data, int $limit): array
+{
+    $items = $data['items'] ?? null;
+    if (!is_array($items)) return $data;
+    $pick = [];
+    foreach ([['cpuPercent', false], ['rssBytes', false], ['swapBytes', true]] as [$key, $positive]) {
+        $list = array_values(array_filter($items, static fn($item): bool =>
+            is_array($item) && is_numeric($item[$key] ?? null) && (!$positive || $item[$key] > 0)));
+        usort($list, static fn($a, $b): int => $b[$key] <=> $a[$key]);
+        foreach (array_slice($list, 0, $limit) as $item) $pick[(int) $item['pid']] = $item;
+    }
+    $data['items'] = array_values($pick);
+    return $data;
 }
 function esmSampleProcesses(): array
 {
@@ -751,7 +1093,8 @@ function esmSampleProcesses(): array
     usort($swapSorted, static fn($a, $b): int => $b['swapBytes'] <=> $a['swapBytes']);
     $selected = [];
     $recordById = array_column($records, null, 'id');
-    foreach (array_merge(array_slice($cpuSorted, 0, 5), array_slice($ramSorted, 0, 5), array_slice($swapSorted, 0, 5)) as $rec) {
+    $keep = max(5, min(50, ESM_PROCESS_DETAIL_LIMIT));
+    foreach (array_merge(array_slice($cpuSorted, 0, $keep), array_slice($ramSorted, 0, $keep), array_slice($swapSorted, 0, $keep)) as $rec) {
         $selected[$rec['id']] = $recordById[$rec['id']];
     }
     foreach ($selected as &$rec) {
@@ -886,7 +1229,7 @@ function esmHttpProbe(array $item): ?array
     );
     if (!is_resource($client)) return $result;
     $request = "GET " . $path . " HTTP/1.1\r\nHost: " . $hostname
-        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/1.0.3\r\nAccept: */*\r\n\r\n";
+        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/1.2.0\r\nAccept: */*\r\n\r\n";
     stream_set_blocking($client, false);
     $pending = $request;
     $headers = '';
@@ -967,11 +1310,14 @@ if (isset($_GET['api'])) {
         echo json_encode(['ok' => false, 'error' => 'Not found']);
         exit;
     }
+    $apiView = in_array($_GET['view'] ?? '', ['overview', 'system', 'network', 'hardware', 'processes'], true)
+        ? (string) $_GET['view'] : 'overview';
     try {
         $collectStart = microtime(true);
         $payload = [
             'ok' => true,
-            'version' => '1.0.3',
+            'view' => $apiView,
+            'version' => '1.2.0',
             'sampleTimeMs' => round(microtime(true) * 1000),
             'system' => esmSafeCollect('system', 'esmSystem', []),
             'cpu' => esmSafeCollect('cpu', 'esmCpu', ['total'=>null, 'idle'=>null, 'cores'=>[]]),
@@ -980,11 +1326,21 @@ if (isset($_GET['api'])) {
             'diskIo' => esmSafeCollect('diskIo', 'esmDiskIo', []),
             'network' => esmSafeCollect('network', 'esmNetwork', []),
             'pressure' => esmSafeCollect('pressure', 'esmPressure', []),
-            'temperatures' => esmSafeCollect('temperatures', 'esmTemperatures', []),
             'services' => esmSafeCollect('services', 'esmServices', []),
-            'processes' => esmSafeCollect('processes', 'esmProcesses', []),
             'httpChecks' => esmSafeCollect('httpChecks', 'esmHttpChecks', []),
+            'reboot' => esmSafeCollect('reboot', 'esmReboot', ['required' => false, 'reasons' => []]),
+            'failedUnits' => esmSafeCollect('failedUnits', 'esmFailedUnits', ['available' => false, 'units' => []]),
+            'ports' => esmSafeCollect('ports', 'esmListeningPorts', []),
         ];
+        // Heavier modules are only collected for the page that shows them.
+        if ($apiView === 'overview' || $apiView === 'processes') {
+            $payload['limit'] = $apiView === 'processes' ? ESM_PROCESS_DETAIL_LIMIT : 5;
+            $payload['processes'] = esmProcessTop(esmSafeCollect('processes', 'esmProcesses', []), $payload['limit']);
+        }
+        if ($apiView === 'hardware') {
+            $payload['temperatures'] = esmSafeCollect('temperatures', 'esmTemperatures', []);
+            $payload['gpus'] = esmSafeCollect('gpus', 'esmGpus', []);
+        }
         $payload['collectionMs'] = round((microtime(true) - $collectStart) * 1000, 1);
         echo json_encode($payload, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
     } catch (Throwable $error) {
@@ -1002,14 +1358,16 @@ header('Content-Type: text/html; charset=utf-8');
 $nonce = htmlspecialchars(esmNonce(), ENT_QUOTES, 'UTF-8');
 $title = htmlspecialchars(ESM_TITLE, ENT_QUOTES, 'UTF-8');
 $refresh = max(2, min(60, ESM_REFRESH_SECONDS));
+$view = in_array($_GET['view'] ?? '', ['overview', 'system', 'network', 'hardware', 'processes'], true)
+    ? (string) $_GET['view'] : 'overview';
 ?><!doctype html>
-<html lang="en" data-style="operations">
+<html lang="en" data-style="operations" data-view="<?= $view ?>">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <title><?= $title ?> · Linux dashboard</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTUiIGZpbGw9IiMwNTA3MGIiLz48cmVjdCB4PSIxMCIgeT0iMTIiIHdpZHRoPSI0NCIgaGVpZ2h0PSIzOCIgcng9IjciIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Y3ZmFmYyIgc3Ryb2tlLXdpZHRoPSIzLjUiLz48cGF0aCBkPSJNMTQgMzNoOWw2LTEzIDggMjUgNi0xMmg3IiBmaWxsPSJub25lIiBzdHJva2U9IiM1NmQ3YzciIHN0cm9rZS13aWR0aD0iNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PC9zdmc+">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3QgeD0iNCIgeT0iNCIgd2lkdGg9IjU2IiBoZWlnaHQ9IjU2IiByeD0iMTIiIGZpbGw9IiMwMjA3MTEiLz48cmVjdCB4PSIxNCIgeT0iMTYuNSIgd2lkdGg9IjM1LjUiIGhlaWdodD0iMjguNSIgcng9IjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIyLjYiLz48cGF0aCBkPSJNMTggMzAuNGg3LjRsMy44LTcuNiA1LjYgMTIuNiA0LjQtNWg3IiBmaWxsPSJub25lIiBzdHJva2U9IiMzYWZmZWMiIHN0cm9rZS13aWR0aD0iMi4yIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cmVjdCB4PSIyOSIgeT0iMzciIHdpZHRoPSIyMy41IiBoZWlnaHQ9IjExIiByeD0iNS41IiBmaWxsPSIjNTk1N2I1IiBzdHJva2U9IiMwMjA3MTEiIHN0cm9rZS13aWR0aD0iMS42Ii8+PHRleHQgeD0iNDAuNzUiIHk9IjQ1LjYiIGZpbGw9IiNmZmYiIGZvbnQtZmFtaWx5PSJBcmlhbCxIZWx2ZXRpY2Esc2Fucy1zZXJpZiIgZm9udC1zaXplPSI4LjYiIGZvbnQtd2VpZ2h0PSI3MDAiIGZvbnQtc3R5bGU9Iml0YWxpYyIgdGV4dC1hbmNob3I9Im1pZGRsZSI+UEhQPC90ZXh0Pjwvc3ZnPg==">
   <style nonce="<?= $nonce ?>">
 
 :root, [data-style="operations"] {
@@ -1031,13 +1389,13 @@ $refresh = max(2, min(60, ESM_REFRESH_SECONDS));
   --accent-glow:transparent;--chart-wash:#f8fafc;
 }
 [data-style="zen"] {
-  color-scheme:light;
-  --bg:#f4f0e7;--surface:#fffefa;--soft:#f6f2ea;
-  --text:#3e382f;--muted:#82796b;--border:#e8e0d2;
-  --accent:#9a7246;--good:#32876d;--warn:#b6823e;--bad:#c56063;
-  --grid:#a37b4214;--shadow:0 3px 7px #3a2b2007,0 16px 45px #3a2b2009;
-  --surface-hi:#ffffff;--surface-border:#ded4c4;
-  --accent-glow:#ac825324;--chart-wash:#f9f6f0;
+  color-scheme:dark;
+  --bg:#273649;--surface:#324559;--soft:#3c5168;
+  --text:#f3f7fc;--muted:#bccbdc;--border:#52677f;
+  --accent:#72d5e7;--good:#6fe2b1;--warn:#f3c98a;--bad:#f6939c;
+  --grid:#9cc7e812;--shadow:0 10px 28px #0000002a;
+  --surface-hi:#384d64;--surface-border:#647d98;
+  --accent-glow:#72d5e724;--chart-wash:#2d3f53;
 }
 
 
@@ -1482,13 +1840,88 @@ button.control:active { transform:translateY(1px); }
 [data-style="pro"] .panel h2 {border-bottom:1px solid var(--border);padding-bottom:10px;}
 [data-style="pro"] .metric:hover {transform:none;box-shadow:none;}
 
-[data-style="zen"] .metric,[data-style="zen"] .panel {border-radius:19px;}
-[data-style="zen"] .header {border-radius:21px;}
-[data-style="zen"] .item,[data-style="zen"] .chart-card {border-radius:14px;}
-[data-style="zen"] .process-item {border-radius:12px;}
-[data-style="zen"] .icon {border-radius:12px;}
+/* "Dim": the night style, lightened */
+[data-style="zen"] body {background-image:linear-gradient(180deg,#30455e 0%,var(--bg) 440px);background-attachment:fixed;}
+[data-style="zen"] .header {border-radius:13px;background:#33495f;border:1px solid #5a7390;}
+[data-style="zen"] .metric,[data-style="zen"] .panel {border-radius:12px;}
+[data-style="zen"] .metric {border-top:2px solid #557089;}
+[data-style="zen"] .metric::before {width:0;}
+[data-style="zen"] .metric:nth-child(1) {border-top-color:#6fd3e6;}
+[data-style="zen"] .metric:nth-child(2) {border-top-color:#7fdcbf;}
+[data-style="zen"] .metric:nth-child(3) {border-top-color:#f3c27f;}
+[data-style="zen"] .metric:nth-child(4) {border-top-color:#b5b3f4;}
+[data-style="zen"] .metric:nth-child(5) {border-top-color:#8ca3bb;}
+[data-style="zen"] .big {font-variant-numeric:tabular-nums;letter-spacing:-.06em;}
+[data-style="zen"] .chart-card {border-radius:7px;}
+[data-style="zen"] .process-item,[data-style="zen"] .item {border-radius:6px;}
+[data-style="zen"] .health-banner {border-radius:8px;background:#30445a;}
+[data-style="zen"] .status {background:#355168;}
 
-  </style>
+  
+/* Process detail page (?view=processes) */
+.process-view { display:none; }
+[data-view="processes"] .process-view { display:block; }
+[data-view="processes"] .dashboard { display:none !important; }
+html:not([data-view="overview"]) .summary { display:none !important; }
+.process-view-head { display:flex; align-items:baseline; flex-wrap:wrap; gap:6px 14px; margin:2px 0 14px; }
+.process-view-head h2 { margin:0; font-size:1.15rem; }
+.detail-columns { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; align-items:start; }
+.detail-columns .panel { margin-bottom:0; }
+.detail-list { list-style:none; margin:0; padding:0; }
+.detail-list .process-item { grid-template-columns:2em minmax(0,1fr) auto; }
+.process-rank { align-self:center; color:var(--muted); font-size:.76rem; font-variant-numeric:tabular-nums; }
+
+/* View tabs */
+.view-tabs { display:flex; flex-wrap:wrap; gap:6px; margin:14px 0 10px; }
+@media (max-width:620px) {
+  .view-tabs { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; margin-inline:-2px; padding:0 2px 2px; }
+  .view-tabs a { flex:0 0 auto; padding:7px 12px; }
+}
+.view-tabs a {
+  padding:8px 15px; border-radius:999px; border:1px solid var(--border); background:var(--surface);
+  color:var(--muted); text-decoration:none; font-size:.86rem; font-weight:680;
+}
+.view-tabs a:hover, .view-tabs a:focus-visible { color:var(--text); border-color:var(--surface-border); }
+.view-tabs a[aria-current="page"] { background:var(--accent); border-color:var(--accent); color:var(--bg); }
+[data-style="pro"] .view-tabs a { border-radius:5px; }
+.panel-action {
+  margin-left:auto; display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:999px;
+  border:1px solid var(--accent); color:var(--accent); text-decoration:none; font-size:.76rem; font-weight:720; white-space:nowrap;
+}
+.panel-action:hover, .panel-action:focus-visible { background:var(--accent); color:var(--bg); }
+[data-style="pro"] .panel-action { border-radius:5px; }
+.health-reasons a { color:inherit; text-decoration:underline dotted; text-underline-offset:3px; }
+.health-reasons a:hover, .health-reasons a:focus-visible { color:var(--accent); }
+.check-row { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:8px 10px; border-radius:8px; background:var(--soft); font-size:.84rem; min-width:0; }
+.check-row + .check-row { margin-top:6px; }
+.check-row .check-name { min-width:0; overflow-wrap:anywhere; }
+.check-row .check-name small { display:block; color:var(--muted); font-size:.72rem; margin-top:2px; }
+.check-row strong { font-variant-numeric:tabular-nums; }
+.pill.warn { color:var(--warn); }
+.ok-message { color:var(--good); font-size:.85rem; font-weight:650; }
+@media (max-width:1100px) { .detail-columns { grid-template-columns:1fr; } }
+
+/* Source code and support footer */
+.site-footer {
+  display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:.45rem;
+  width:max-content; max-width:100%; margin:0 auto 26px; padding:9px 16px; border-radius:999px;
+  background:rgba(9,13,22,.78); color:rgba(245,247,255,.72); border:1px solid rgba(255,255,255,.12);
+  box-shadow:0 10px 28px rgba(0,0,0,.18); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:.92rem; line-height:1.25;
+}
+.site-footer[hidden] { display:none; }
+.site-footer a { color:#d7c8ff; text-decoration:none; font-weight:700; }
+.site-footer a:hover, .site-footer a:focus-visible { text-decoration:underline; }
+.site-footer .footer-sep { color:rgba(245,247,255,.45); }
+.footer-support { display:inline-flex; align-items:center; gap:.28rem; color:#f5d987 !important; }
+.footer-support strong { color:#ffe68d; font-weight:800; }
+.footer-strike { color:#e7c0a0; text-decoration-line:line-through; text-decoration-color:#d76a7d; text-decoration-thickness:.14em; }
+.footer-cup { width:1.05em; height:1.05em; color:#d9b963; flex:0 0 auto; stroke-width:1.9; }
+@media (max-width:620px) {
+  .site-footer { padding:8px 12px; border-radius:18px; font-size:.82rem; row-gap:5px; }
+  .site-footer .footer-text { width:100%; text-align:center; }
+}
+</style>
 </head>
 <body>
   <div class="wrap">
@@ -1513,12 +1946,19 @@ button.control:active { transform:translateY(1px); }
           <option value="hi">हिन्दी</option>
           <option value="ja">日本語</option>
         </select>
-        <label class="style-picker"><span data-i18n="interfaceStyle">Style</span><select class="control" id="styleChoice" aria-label="Interface style"><option value="operations">Operations</option><option value="pro">Pro</option><option value="zen">Zen</option></select></label>
+        <label class="style-picker"><span data-i18n="interfaceStyle">Style</span><select class="control" id="styleChoice" aria-label="Interface style"><option value="operations" data-i18n="styleNight">Night</option><option value="zen" data-i18n="styleDim">Dim</option><option value="pro" data-i18n="styleLight">Light</option></select></label>
         <button type="button" class="control" id="settings" aria-label="Settings" title="Settings">⚙</button>
         <button type="button" class="control" id="refresh" aria-label="Refresh" title="Refresh">↻</button>
       </div>
     </header>
 
+    <nav class="view-tabs" id="viewTabs" aria-label="Views">
+      <a href="?view=overview" data-view-link="overview" data-i18n="viewOverview">Overview</a>
+      <a href="?view=system" data-view-link="system" data-i18n="viewSystem">System</a>
+      <a href="?view=network" data-view-link="network" data-i18n="viewNetwork">Network</a>
+      <a href="?view=hardware" data-view-link="hardware" data-i18n="viewHardware">Hardware</a>
+      <a href="?view=processes" data-view-link="processes" data-i18n="viewProcesses">Processes</a>
+    </nav>
     <div id="errorBanner" class="error-banner" role="alert"></div>
     <div class="system-head">
       <div><span data-i18n="host">Host</span>: <strong id="hostName">—</strong> · <span id="osSummary">—</span></div>
@@ -1598,7 +2038,7 @@ button.control:active { transform:translateY(1px); }
         </section>
 
         <section class="panel" id="panel-processes" data-panel="processes">
-          <h2><span class="icon" aria-hidden="true">☷</span><span data-i18n="processes">Top processes</span></h2>
+          <h2><span class="icon" aria-hidden="true">☷</span><span data-i18n="processes">Top processes</span><a class="panel-action" href="?view=processes" data-view-link="processes"><span data-i18n="showTop20">Show top 20</span><span aria-hidden="true">→</span></a></h2>
           <div class="process-columns">
             <div class="process-group">
               <h3 data-i18n="topCpu">Top 5 CPU</h3>
@@ -1627,6 +2067,23 @@ button.control:active { transform:translateY(1px); }
           <h2><span class="icon" aria-hidden="true">⇣</span><span data-i18n="diskIo">Disk activity</span></h2>
           <div id="diskIoList"></div>
           <div class="help-cluster"><button type="button" class="help-button" data-help="diskIoNote" aria-label="Help">?</button></div>
+        </section>
+
+        <section class="panel" id="panel-checks" data-panel="checks">
+          <h2><span class="icon" aria-hidden="true">✓</span><span data-i18n="checksPanel">Services status</span><a class="panel-action" href="?view=network" data-view-link="network"><span data-i18n="details">Details</span><span aria-hidden="true">→</span></a></h2>
+          <div id="checksList"></div>
+        </section>
+
+        <section class="panel" id="panel-failed" data-panel="failed">
+          <h2><span class="icon" aria-hidden="true">⚠</span><span data-i18n="failedUnits">Failed services (systemd)</span></h2>
+          <div id="failedList"></div>
+          <div class="help-cluster"><button type="button" class="help-button" data-help="failedNote" aria-label="Help">?</button></div>
+        </section>
+
+        <section class="panel" id="panel-ports" data-panel="ports">
+          <h2><span class="icon" aria-hidden="true">⇵</span><span data-i18n="listeningPorts">Listening ports (TCP)</span></h2>
+          <div id="portsList"></div>
+          <div class="help-cluster"><button type="button" class="help-button" data-help="portsNote" aria-label="Help">?</button></div>
         </section>
 
         <section class="panel" id="panel-services" data-panel="services">
@@ -1670,6 +2127,26 @@ button.control:active { transform:translateY(1px); }
         </section>
       </div>
     </main>
+
+    <div id="panelStore" hidden></div>
+    <main class="process-view" id="processView" aria-labelledby="detailTitle">
+      <div class="process-view-head"><h2 id="detailTitle" data-i18n="detailTitle">Top 20 processes</h2><span class="tiny" id="detailNote"></span></div>
+      <div class="detail-columns">
+        <section class="panel" id="detail-cpu">
+          <h2><span class="icon" aria-hidden="true">◉</span><span data-i18n="top20Cpu">Top 20 · CPU</span></h2>
+          <ol class="detail-list" id="detailCpuList"></ol>
+        </section>
+        <section class="panel" id="detail-ram">
+          <h2><span class="icon" aria-hidden="true">▥</span><span data-i18n="top20Ram">Top 20 · RAM</span></h2>
+          <ol class="detail-list" id="detailRamList"></ol>
+        </section>
+        <section class="panel" id="detail-swap">
+          <h2><span class="icon" aria-hidden="true">⇄</span><span data-i18n="top20Swap">Top 20 · Swap</span></h2>
+          <ol class="detail-list" id="detailSwapList"></ol>
+        </section>
+      </div>
+      <div class="help-cluster" id="detailHelpCluster"><button type="button" class="help-button" data-help="processNote,ramFormula,pssExplanation,swapProcessExplanation" aria-label="Help">?</button></div>
+    </main>
     <div id="helpPopover" class="help-popover" role="tooltip" hidden></div>
     <div id="chartTooltip" class="chart-tooltip" role="status" hidden></div>
     <dialog class="dialog" id="settingsDialog" aria-labelledby="settingsTitle">
@@ -1686,6 +2163,8 @@ button.control:active { transform:translateY(1px); }
       <h3 data-i18n="visibleCharts">Visible charts</h3><div id="chartToggles" class="settings-checks"></div>
       <h3 data-i18n="visiblePanels">Panels: visibility and order</h3><div class="help-cluster"><button type="button" class="help-button" data-help="orderNote" aria-label="Help">?</button></div>
       <div id="panelToggles" class="settings-panels"></div>
+      <h3 data-i18n="footerSetting">Footer</h3>
+      <div class="settings-checks"><label><input type="checkbox" id="showFooter"><span data-i18n="showFooter">Show the source code and support links</span></label></div>
       <div class="dialog-actions"><button type="button" class="control" id="resetSettings" data-i18n="resetSettings">Reset preferences</button><button type="button" class="control primary" id="doneSettings" data-i18n="done">Done</button></div>
     </dialog>
     <dialog class="dialog zoom-dialog" id="chartDialog" aria-labelledby="zoomTitle">
@@ -1694,7 +2173,15 @@ button.control:active { transform:translateY(1px); }
       <div class="help-cluster"><button type="button" class="help-button" data-help="historyNote" aria-label="Help">?</button></div>
     </dialog>
 
-    <footer class="foot">Monitor made Simple 1.0.3 · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
+    <footer class="foot">Monitor made Simple 1.2.0 · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
+    <footer class="site-footer" id="siteFooter" aria-label="Source code and support">
+      <span class="footer-text" data-i18n="footerSource">Source code and support:</span>
+      <a href="https://github.com/Fabrice-breizh" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <span class="footer-sep" aria-hidden="true">·</span>
+      <a class="footer-support" href="https://www.buymeacoffee.com/fabricebreizh" target="_blank" rel="noopener noreferrer" aria-label="Buy me some tokens">
+        <svg class="footer-cup" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5h10v6a5 5 0 0 1-10 0V5Z"/><path d="M15 7h2a3 3 0 0 1 0 6h-2"/><path d="M4 19h13"/><path d="M7 22h7"/></svg><span data-i18n="footerBuyMe">Buy me</span> <span class="footer-strike" data-i18n="footerCoffee">a coffee</span> <strong data-i18n="footerTokens">some tokens</strong><svg class="footer-cup" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5h10v6a5 5 0 0 1-10 0V5Z"/><path d="M15 7h2a3 3 0 0 1 0 6h-2"/><path d="M4 19h13"/><path d="M7 22h7"/></svg>
+      </a>
+    </footer>
   </div>
   <script nonce="<?= $nonce ?>">
 'use strict';
@@ -1755,6 +2242,60 @@ const words = {
     "moveUp": "Move up",
     "moveDown": "Move down",
     "resetSettings": "Reset preferences",
+    "viewOverview": "Overview",
+    "viewSystem": "System",
+    "viewNetwork": "Network",
+    "viewHardware": "Hardware",
+    "viewProcesses": "Processes",
+    "showTop20": "Show top 20",
+    "details": "Details",
+    "checksPanel": "Services status",
+    "noChecks": "No service check configured.",
+    "failedUnits": "Failed services (systemd)",
+    "noFailedUnits": "No failed service.",
+    "systemdUnavailable": "Unavailable: systemctl is missing or not allowed for the web server user.",
+    "failedNote": "Units that systemd reports as failed. Check them with: systemctl status <unit>. Refreshed every minute.",
+    "listeningPorts": "Listening ports (TCP)",
+    "noPorts": "No listening port found.",
+    "portScopeAll": "All interfaces",
+    "portScopeLocal": "Local only",
+    "portSensitive": "database or API",
+    "portsNote": "TCP ports open on this server. \"All interfaces\" means reachable from the network, unless a firewall blocks it. \"Local only\" means reachable from this machine only. Process names would require root access.",
+    "rebootRequired": "Restart required",
+    "rebootNo": "No",
+    "rebootKernel": "kernel {k} installed, {r} running",
+    "rebootPackages": "updated packages",
+    "healthReboot": "Restart required",
+    "healthFailedUnits": "Failed services",
+    "healthExposedPort": "listening on all interfaces",
+    "yes": "Yes",
+    "styleNight": "Night",
+    "styleDim": "Dim",
+    "styleLight": "Light",
+    "physicalCores": "Physical cores",
+    "tempCpu": "CPU temperature",
+    "tempDisk": "Disk temperature",
+    "tempBoard": "Motherboard temperature",
+    "tempChipset": "Chipset temperature",
+    "tempWifi": "Wi-Fi temperature",
+    "gpu": "Graphics card",
+    "gpuUsage": "GPU usage",
+    "gpuMemory": "Video memory",
+    "gpuTemp": "GPU temperature",
+    "gpuPower": "GPU power",
+    "gpuClock": "GPU clock",
+    "openDetail": "Open the top 20 in a new tab",
+    "detailTitle": "Top 20 processes",
+    "top20Cpu": "Top 20 · CPU",
+    "top20Ram": "Top 20 · RAM",
+    "top20Swap": "Top 20 · Swap",
+    "detailNote": "Refreshed every {s} s, from the same sample as the dashboard.",
+    "footerSetting": "Footer",
+    "showFooter": "Show the source code and support links",
+    "footerSource": "Source code and support:",
+    "footerBuyMe": "Buy me",
+    "footerCoffee": "a coffee",
+    "footerTokens": "some tokens",
     "done": "Done",
     "healthDisclaimer": "Heuristic based on accessible metrics and configured checks; not a complete diagnosis.",
     "healthy": "Normal",
@@ -1911,6 +2452,60 @@ const words = {
     "moveUp": "Monter",
     "moveDown": "Descendre",
     "resetSettings": "Réinitialiser les préférences",
+    "viewOverview": "Vue d'ensemble",
+    "viewSystem": "Système",
+    "viewNetwork": "Réseau",
+    "viewHardware": "Matériel",
+    "viewProcesses": "Processus",
+    "showTop20": "Afficher le top 20",
+    "details": "Détails",
+    "checksPanel": "État des services",
+    "noChecks": "Aucun test de service configuré.",
+    "failedUnits": "Services en échec (systemd)",
+    "noFailedUnits": "Aucun service en échec.",
+    "systemdUnavailable": "Indisponible : systemctl est absent ou non autorisé pour l'utilisateur du serveur web.",
+    "failedNote": "Unités que systemd signale en échec. Pour les examiner : systemctl status <unité>. Actualisé chaque minute.",
+    "listeningPorts": "Ports en écoute (TCP)",
+    "noPorts": "Aucun port en écoute trouvé.",
+    "portScopeAll": "Toutes les interfaces",
+    "portScopeLocal": "Local uniquement",
+    "portSensitive": "base de données ou API",
+    "portsNote": "Ports TCP ouverts sur ce serveur. « Toutes les interfaces » : joignable depuis le réseau, sauf si un pare-feu le bloque. « Local uniquement » : joignable depuis cette machine seulement. Le nom des processus nécessiterait les droits root.",
+    "rebootRequired": "Redémarrage nécessaire",
+    "rebootNo": "Non",
+    "rebootKernel": "noyau {k} installé, {r} en cours",
+    "rebootPackages": "paquets mis à jour",
+    "healthReboot": "Redémarrage nécessaire",
+    "healthFailedUnits": "Services en échec",
+    "healthExposedPort": "en écoute sur toutes les interfaces",
+    "yes": "Oui",
+    "styleNight": "Nuit",
+    "styleDim": "Intermédiaire",
+    "styleLight": "Clair",
+    "physicalCores": "Cœurs physiques",
+    "tempCpu": "Température CPU",
+    "tempDisk": "Température disque",
+    "tempBoard": "Température carte mère",
+    "tempChipset": "Température chipset",
+    "tempWifi": "Température Wi-Fi",
+    "gpu": "Carte graphique",
+    "gpuUsage": "Utilisation GPU",
+    "gpuMemory": "Mémoire vidéo",
+    "gpuTemp": "Température GPU",
+    "gpuPower": "Consommation GPU",
+    "gpuClock": "Fréquence GPU",
+    "openDetail": "Ouvrir le top 20 dans un nouvel onglet",
+    "detailTitle": "Top 20 des processus",
+    "top20Cpu": "Top 20 · CPU",
+    "top20Ram": "Top 20 · RAM",
+    "top20Swap": "Top 20 · Swap",
+    "detailNote": "Actualisé toutes les {s} s, à partir du même relevé que le tableau de bord.",
+    "footerSetting": "Pied de page",
+    "showFooter": "Afficher les liens vers le code source et le soutien",
+    "footerSource": "Code source et support :",
+    "footerBuyMe": "Offrez-moi",
+    "footerCoffee": "un café",
+    "footerTokens": "des tokens",
     "done": "Terminé",
     "healthDisclaimer": "Indicateur fondé sur les métriques accessibles et les contrôles configurés, sans prétendre à un diagnostic complet.",
     "healthy": "Normal",
@@ -2067,6 +2662,60 @@ const words = {
     "moveUp": "Subir",
     "moveDown": "Bajar",
     "resetSettings": "Restablecer preferencias",
+    "viewOverview": "Resumen",
+    "viewSystem": "Sistema",
+    "viewNetwork": "Red",
+    "viewHardware": "Hardware",
+    "viewProcesses": "Procesos",
+    "showTop20": "Ver el top 20",
+    "details": "Detalles",
+    "checksPanel": "Estado de los servicios",
+    "noChecks": "No hay comprobaciones de servicio configuradas.",
+    "failedUnits": "Servicios con error (systemd)",
+    "noFailedUnits": "Ningún servicio con error.",
+    "systemdUnavailable": "No disponible: systemctl no existe o no está permitido para el usuario del servidor web.",
+    "failedNote": "Unidades que systemd marca como fallidas. Para revisarlas: systemctl status <unidad>. Se actualiza cada minuto.",
+    "listeningPorts": "Puertos en escucha (TCP)",
+    "noPorts": "No se encontró ningún puerto en escucha.",
+    "portScopeAll": "Todas las interfaces",
+    "portScopeLocal": "Solo local",
+    "portSensitive": "base de datos o API",
+    "portsNote": "Puertos TCP abiertos en este servidor. «Todas las interfaces»: accesible desde la red, salvo que un cortafuegos lo bloquee. «Solo local»: accesible solo desde esta máquina. Ver el nombre de los procesos requeriría acceso root.",
+    "rebootRequired": "Reinicio necesario",
+    "rebootNo": "No",
+    "rebootKernel": "kernel {k} instalado, {r} en uso",
+    "rebootPackages": "paquetes actualizados",
+    "healthReboot": "Reinicio necesario",
+    "healthFailedUnits": "Servicios con error",
+    "healthExposedPort": "en escucha en todas las interfaces",
+    "yes": "Sí",
+    "styleNight": "Noche",
+    "styleDim": "Intermedio",
+    "styleLight": "Claro",
+    "physicalCores": "Núcleos físicos",
+    "tempCpu": "Temperatura CPU",
+    "tempDisk": "Temperatura del disco",
+    "tempBoard": "Temperatura de la placa base",
+    "tempChipset": "Temperatura del chipset",
+    "tempWifi": "Temperatura Wi-Fi",
+    "gpu": "Tarjeta gráfica",
+    "gpuUsage": "Uso de GPU",
+    "gpuMemory": "Memoria de vídeo",
+    "gpuTemp": "Temperatura GPU",
+    "gpuPower": "Consumo GPU",
+    "gpuClock": "Frecuencia GPU",
+    "openDetail": "Abrir el top 20 en una nueva pestaña",
+    "detailTitle": "Top 20 de procesos",
+    "top20Cpu": "Top 20 · CPU",
+    "top20Ram": "Top 20 · RAM",
+    "top20Swap": "Top 20 · Swap",
+    "detailNote": "Actualizado cada {s} s, con la misma muestra que el panel.",
+    "footerSetting": "Pie de página",
+    "showFooter": "Mostrar los enlaces al código fuente y al apoyo",
+    "footerSource": "Código fuente y soporte:",
+    "footerBuyMe": "Invítame a",
+    "footerCoffee": "un café",
+    "footerTokens": "unos tokens",
     "done": "Listo",
     "healthDisclaimer": "Indicador aproximado basado en métricas accesibles y comprobaciones configuradas; no es un diagnóstico completo.",
     "healthy": "Normal",
@@ -2223,6 +2872,60 @@ const words = {
     "moveUp": "上移",
     "moveDown": "下移",
     "resetSettings": "恢复默认设置",
+    "viewOverview": "概览",
+    "viewSystem": "系统",
+    "viewNetwork": "网络",
+    "viewHardware": "硬件",
+    "viewProcesses": "进程",
+    "showTop20": "查看前 20 名",
+    "details": "详情",
+    "checksPanel": "服务状态",
+    "noChecks": "未配置服务检测。",
+    "failedUnits": "失败的服务 (systemd)",
+    "noFailedUnits": "没有失败的服务。",
+    "systemdUnavailable": "不可用：systemctl 不存在或 Web 服务器用户无权使用。",
+    "failedNote": "systemd 报告为失败的单元。可用 systemctl status <单元> 查看。每分钟刷新。",
+    "listeningPorts": "监听端口 (TCP)",
+    "noPorts": "未发现监听端口。",
+    "portScopeAll": "所有网络接口",
+    "portScopeLocal": "仅本机",
+    "portSensitive": "数据库或 API",
+    "portsNote": "本服务器上开放的 TCP 端口。“所有网络接口”表示可从网络访问（除非被防火墙阻止）。“仅本机”表示只能从本机访问。显示进程名称需要 root 权限。",
+    "rebootRequired": "需要重启",
+    "rebootNo": "否",
+    "rebootKernel": "已安装内核 {k}，正在运行 {r}",
+    "rebootPackages": "已更新的软件包",
+    "healthReboot": "需要重启",
+    "healthFailedUnits": "失败的服务",
+    "healthExposedPort": "正在所有网络接口上监听",
+    "yes": "是",
+    "styleNight": "夜间",
+    "styleDim": "柔和",
+    "styleLight": "浅色",
+    "physicalCores": "物理核心",
+    "tempCpu": "CPU 温度",
+    "tempDisk": "磁盘温度",
+    "tempBoard": "主板温度",
+    "tempChipset": "芯片组温度",
+    "tempWifi": "Wi-Fi 温度",
+    "gpu": "显卡",
+    "gpuUsage": "GPU 使用率",
+    "gpuMemory": "显存",
+    "gpuTemp": "GPU 温度",
+    "gpuPower": "GPU 功耗",
+    "gpuClock": "GPU 频率",
+    "openDetail": "在新标签页中打开前 20 名",
+    "detailTitle": "进程前 20 名",
+    "top20Cpu": "CPU 占用前 20",
+    "top20Ram": "内存占用前 20",
+    "top20Swap": "Swap 占用前 20",
+    "detailNote": "每 {s} 秒刷新，与仪表板使用同一次采样。",
+    "footerSetting": "页脚",
+    "showFooter": "显示源代码与支持链接",
+    "footerSource": "源码与支持：",
+    "footerBuyMe": "请我喝",
+    "footerCoffee": "咖啡",
+    "footerTokens": "tokens",
     "done": "完成",
     "healthDisclaimer": "状态基于可用指标及已配置检测的估算，不代表完整诊断。",
     "healthy": "正常",
@@ -2379,6 +3082,60 @@ const words = {
     "moveUp": "ऊपर ले जाएँ",
     "moveDown": "नीचे ले जाएँ",
     "resetSettings": "सेटिंग्स रीसेट करें",
+    "viewOverview": "सारांश",
+    "viewSystem": "सिस्टम",
+    "viewNetwork": "नेटवर्क",
+    "viewHardware": "हार्डवेयर",
+    "viewProcesses": "प्रक्रियाएँ",
+    "showTop20": "शीर्ष 20 देखें",
+    "details": "विवरण",
+    "checksPanel": "सेवाओं की स्थिति",
+    "noChecks": "कोई सेवा जाँच कॉन्फ़िगर नहीं है।",
+    "failedUnits": "विफल सेवाएँ (systemd)",
+    "noFailedUnits": "कोई विफल सेवा नहीं।",
+    "systemdUnavailable": "उपलब्ध नहीं: systemctl मौजूद नहीं है या वेब सर्वर उपयोगकर्ता के लिए अनुमति नहीं है।",
+    "failedNote": "वे यूनिट जिन्हें systemd विफल बताता है। जाँचने के लिए: systemctl status <यूनिट>। हर मिनट अपडेट।",
+    "listeningPorts": "सुनने वाले पोर्ट (TCP)",
+    "noPorts": "कोई सुनने वाला पोर्ट नहीं मिला।",
+    "portScopeAll": "सभी इंटरफ़ेस",
+    "portScopeLocal": "केवल स्थानीय",
+    "portSensitive": "डेटाबेस या API",
+    "portsNote": "इस सर्वर पर खुले TCP पोर्ट। \"सभी इंटरफ़ेस\" का अर्थ है नेटवर्क से पहुँच योग्य, जब तक फ़ायरवॉल न रोके। \"केवल स्थानीय\" का अर्थ है केवल इसी मशीन से। प्रक्रिया के नाम के लिए root अधिकार चाहिए।",
+    "rebootRequired": "रीस्टार्ट आवश्यक",
+    "rebootNo": "नहीं",
+    "rebootKernel": "कर्नेल {k} इंस्टॉल, {r} चल रहा है",
+    "rebootPackages": "अपडेट किए गए पैकेज",
+    "healthReboot": "रीस्टार्ट आवश्यक",
+    "healthFailedUnits": "विफल सेवाएँ",
+    "healthExposedPort": "सभी इंटरफ़ेस पर सुन रहा है",
+    "yes": "हाँ",
+    "styleNight": "रात",
+    "styleDim": "मध्यम",
+    "styleLight": "हल्का",
+    "physicalCores": "भौतिक कोर",
+    "tempCpu": "CPU तापमान",
+    "tempDisk": "डिस्क तापमान",
+    "tempBoard": "मदरबोर्ड तापमान",
+    "tempChipset": "चिपसेट तापमान",
+    "tempWifi": "Wi-Fi तापमान",
+    "gpu": "ग्राफ़िक्स कार्ड",
+    "gpuUsage": "GPU उपयोग",
+    "gpuMemory": "वीडियो मेमोरी",
+    "gpuTemp": "GPU तापमान",
+    "gpuPower": "GPU बिजली खपत",
+    "gpuClock": "GPU आवृत्ति",
+    "openDetail": "शीर्ष 20 को नए टैब में खोलें",
+    "detailTitle": "शीर्ष 20 प्रक्रियाएँ",
+    "top20Cpu": "शीर्ष 20 · CPU",
+    "top20Ram": "शीर्ष 20 · RAM",
+    "top20Swap": "शीर्ष 20 · स्वैप",
+    "detailNote": "हर {s} सेकंड में अपडेट, डैशबोर्ड वाले ही नमूने से।",
+    "footerSetting": "फ़ुटर",
+    "showFooter": "सोर्स कोड और सहायता लिंक दिखाएँ",
+    "footerSource": "सोर्स कोड और सहायता:",
+    "footerBuyMe": "मुझे",
+    "footerCoffee": "कॉफी",
+    "footerTokens": "tokens दिलाएं",
     "done": "पूर्ण",
     "healthDisclaimer": "उपलब्ध आँकड़ों और कॉन्फ़िगर की गई जाँचों पर आधारित अनुमान; संपूर्ण निदान नहीं।",
     "healthy": "सामान्य",
@@ -2535,6 +3292,60 @@ const words = {
     "moveUp": "上へ",
     "moveDown": "下へ",
     "resetSettings": "設定を初期化",
+    "viewOverview": "概要",
+    "viewSystem": "システム",
+    "viewNetwork": "ネットワーク",
+    "viewHardware": "ハードウェア",
+    "viewProcesses": "プロセス",
+    "showTop20": "上位20件を表示",
+    "details": "詳細",
+    "checksPanel": "サービスの状態",
+    "noChecks": "サービスチェックが設定されていません。",
+    "failedUnits": "失敗したサービス (systemd)",
+    "noFailedUnits": "失敗したサービスはありません。",
+    "systemdUnavailable": "利用不可：systemctl が存在しないか、Web サーバーのユーザーに許可されていません。",
+    "failedNote": "systemd が失敗と報告しているユニットです。確認するには：systemctl status <ユニット>。1分ごとに更新。",
+    "listeningPorts": "待ち受けポート (TCP)",
+    "noPorts": "待ち受けポートはありません。",
+    "portScopeAll": "すべてのインターフェース",
+    "portScopeLocal": "ローカルのみ",
+    "portSensitive": "データベースまたは API",
+    "portsNote": "このサーバーで開いている TCP ポートです。「すべてのインターフェース」はファイアウォールで遮断されていない限りネットワークから接続可能、「ローカルのみ」はこのマシンからのみ接続可能です。プロセス名の表示には root 権限が必要です。",
+    "rebootRequired": "再起動が必要",
+    "rebootNo": "いいえ",
+    "rebootKernel": "カーネル {k} がインストール済み、{r} が稼働中",
+    "rebootPackages": "更新されたパッケージ",
+    "healthReboot": "再起動が必要",
+    "healthFailedUnits": "失敗したサービス",
+    "healthExposedPort": "すべてのインターフェースで待ち受け中",
+    "yes": "はい",
+    "styleNight": "ナイト",
+    "styleDim": "ミディアム",
+    "styleLight": "ライト",
+    "physicalCores": "物理コア",
+    "tempCpu": "CPU 温度",
+    "tempDisk": "ディスク温度",
+    "tempBoard": "マザーボード温度",
+    "tempChipset": "チップセット温度",
+    "tempWifi": "Wi-Fi 温度",
+    "gpu": "グラフィックカード",
+    "gpuUsage": "GPU 使用率",
+    "gpuMemory": "ビデオメモリ",
+    "gpuTemp": "GPU 温度",
+    "gpuPower": "GPU 消費電力",
+    "gpuClock": "GPU クロック",
+    "openDetail": "上位20件を新しいタブで開く",
+    "detailTitle": "プロセス上位20件",
+    "top20Cpu": "CPU 上位20件",
+    "top20Ram": "RAM 上位20件",
+    "top20Swap": "Swap 使用量 上位20件",
+    "detailNote": "{s} 秒ごとに更新（ダッシュボードと同じサンプル）。",
+    "footerSetting": "フッター",
+    "showFooter": "ソースコードとサポートのリンクを表示",
+    "footerSource": "ソースコードとサポート：",
+    "footerBuyMe": "奢ってください",
+    "footerCoffee": "コーヒー",
+    "footerTokens": "tokens",
     "done": "完了",
     "healthDisclaimer": "取得可能な指標と設定済みチェックに基づく目安であり、完全な診断ではありません。",
     "healthy": "正常",
@@ -2644,6 +3455,18 @@ const words = {
 // 20. CLIENT STATE AND PREFERENCES
 // =============================================================
 const $ = (id) => document.getElementById(id);
+const VIEWS = ['overview', 'system', 'network', 'hardware', 'processes'];
+const VIEW_LABELS = {overview:'viewOverview', system:'viewSystem', network:'viewNetwork', hardware:'viewHardware', processes:'viewProcesses'};
+let currentView = VIEWS.includes(document.documentElement.dataset.view) ? document.documentElement.dataset.view : 'overview';
+// Panels of each page; on the overview, the order and visibility can be customized.
+const pageGroups = {
+  system: {left:['system', 'failed'], right:['pressure']},
+  network: {left:['network', 'ports'], right:['services', 'http']},
+  hardware: {left:['hardware'], right:['storage']},
+  processes: {left:[], right:[]},
+};
+const PROCESS_REFRESH_SECONDS = <?= (int) ESM_PROCESS_CACHE_SECONDS ?>;
+const PAGE_TITLE = document.title;
 const styles = ['operations', 'pro', 'zen'];
 const HISTORY_LIMIT = 600;
 
@@ -2658,16 +3481,15 @@ const savedLanguage = setting('esmLang');
 const browserLanguage = (navigator.language || 'en').slice(0, 2).toLowerCase();
 let lang = words[savedLanguage] ? savedLanguage : (words[browserLanguage] ? browserLanguage : 'en');
 let visualStyle = styles.includes(setting('mmsStyle')) ? setting('mmsStyle') : 'operations';
+let showFooter = setting('mmsShowFooter') !== '0';
 
 const chartKeys = {cpu:'cpuGraph',ram:'memoryGraph',swap:'swapGraph',net:'networkGraph',io:'diskGraph'};
 const panelGroups = {
-  left:['activity','processes','storage','services'],
-  right:['system','network','http','hardware','pressure'],
+  left:['activity'],
+  right:['checks','processes'],
 };
-const panelLabels = {
-  activity:'activity', processes:'processes', storage:'storage', services:'services',
-  system:'system', network:'network', http:'httpChecks', hardware:'hardware', pressure:'pressure',
-};
+const panelLabels = {activity:'activity', processes:'processes', checks:'checksPanel'};
+const allPanels = ['activity','processes','checks','storage','services','system','failed','ports','network','http','hardware','pressure'];
 function jsonSetting(key, fallback) {
   try { const value = JSON.parse(setting(key)); return value ?? fallback; }
   catch { return fallback; }
@@ -3088,20 +3910,28 @@ function updateChartTitles() {
 // =============================================================
 // 23. DIAGNOSTICS AND HEALTH
 // =============================================================
-function renderProcesses(data) {
+function processLists(data, limit) {
   const processes = data.processes?.items || [];
-  const cpu = processes.filter(proc => Number.isFinite(proc.cpuPercent))
-    .sort((a,b) => b.cpuPercent - a.cpuPercent).slice(0,5);
-  const ram = processes.filter(proc => Number.isFinite(proc.rssBytes))
-    .sort((a,b) => b.rssBytes - a.rssBytes).slice(0,5);
-  const swap = processes.filter(proc => Number.isFinite(proc.swapBytes) && proc.swapBytes > 0)
-    .sort((a,b) => b.swapBytes - a.swapBytes).slice(0,5);
-  function fill(id, list, kind) {
+  return {
+    all: processes,
+    cpu: processes.filter(proc => Number.isFinite(proc.cpuPercent))
+      .sort((a,b) => b.cpuPercent - a.cpuPercent).slice(0,limit),
+    ram: processes.filter(proc => Number.isFinite(proc.rssBytes))
+      .sort((a,b) => b.rssBytes - a.rssBytes).slice(0,limit),
+    swap: processes.filter(proc => Number.isFinite(proc.swapBytes) && proc.swapBytes > 0)
+      .sort((a,b) => b.swapBytes - a.swapBytes).slice(0,limit),
+  };
+}
+function fillProcessList(id, list, kind, processes, ranked = false) {
     const target = $(id);
     target.replaceChildren();
-    if (!list.length) { empty(target, !processes.length ? t('noProcess') : kind === 'swap' ? t('noSwapProcess') : t('estimating')); return; }
-    for (const proc of list) {
-      const item = node('div','process-item');
+    if (!list.length) {
+      empty(target, !processes.length ? t('noProcess') : kind === 'swap' ? t('noSwapProcess') : t('estimating'));
+      return;
+    }
+    list.forEach((proc, index) => {
+      const item = node(ranked ? 'li' : 'div','process-item');
+      if (ranked) item.append(node('span','process-rank',String(index + 1)));
       const left = node('div');
       const name = node('div','process-name',proc.name || '—');
       name.title = proc.name || '';
@@ -3112,13 +3942,23 @@ function renderProcesses(data) {
       const value = kind === 'cpu' ? pct(proc.cpuPercent) : bytes(kind === 'swap' ? proc.swapBytes : proc.rssBytes);
       item.append(left,node('strong','process-value',value));
       target.append(item);
-    }
-  }
-  fill('processCpuList',cpu,'cpu');
-  fill('processRamList',ram,'ram');
-  fill('processSwapList',swap,'swap');
+    });
+}
+function renderProcesses(data) {
+  const {all: processes, cpu, ram, swap} = processLists(data, 5);
+  fillProcessList('processCpuList',cpu,'cpu',processes);
+  fillProcessList('processRamList',ram,'ram',processes);
+  fillProcessList('processSwapList',swap,'swap',processes);
   $('collaboraNote').hidden = !processes.some(proc => /^(?:forkit|kit_spare(?:_.*)?)$/i.test(proc.name || ''));
   $('processHelpCluster').querySelector('[data-help]').dataset.help = (data.processes?.partial ? 'processPartial' : 'processNote') + ',ramFormula,pssExplanation,swapProcessExplanation';
+}
+function renderProcessDetail(data) {
+  const {all: processes, cpu, ram, swap} = processLists(data, Number(data.limit) || 20);
+  fillProcessList('detailCpuList',cpu,'cpu',processes,true);
+  fillProcessList('detailRamList',ram,'ram',processes,true);
+  fillProcessList('detailSwapList',swap,'swap',processes,true);
+  setText('detailNote', t('detailNote').replace('{s}', String(PROCESS_REFRESH_SECONDS)));
+  $('detailHelpCluster').querySelector('[data-help]').dataset.help = (data.processes?.partial ? 'processPartial' : 'processNote') + ',ramFormula,pssExplanation,swapProcessExplanation';
 }
 function renderHttp(data) {
   const target = $('httpList');
@@ -3156,47 +3996,58 @@ function renderHttp(data) {
 function renderHealth(data) {
   const warnings = [];
   let severity = 0;
-  function add(level, reason) {
+  function add(level, reason, view = null) {
     severity = Math.max(severity,level);
-    warnings.push(reason);
+    warnings.push({reason, view});
   }
   function usage(value, threshold, key) {
     if (value === null || !Number.isFinite(value)) return;
     if (value >= Math.min(99, threshold+10)) add(2,`${t(key)}${localeColon()}${pct(value)}`);
     else if (value >= threshold) add(1,`${t(key)}${localeColon()}${pct(value)}`);
   }
-  usage(state.rates.cpu, thresholds.cpu,'cpu');
+  function usageIn(view, ...args) {
+    const before = warnings.length;
+    usage(...args);
+    for (let i = before; i < warnings.length; i++) warnings[i].view = view;
+  }
+  usageIn('processes', state.rates.cpu, thresholds.cpu,'cpu');
   const ram = data.memory?.ram;
-  usage(ram ? percentage(ram.used, ram.total) : null, thresholds.ram,'memory');
+  usageIn('processes', ram ? percentage(ram.used, ram.total) : null, thresholds.ram,'memory');
   for (const disk of data.disks || []) {
-    usage(percentage(disk.used, disk.total), thresholds.disk, `${disk.mount}`);
-    if (disk.inodes) usage(percentage(disk.inodes.used,disk.inodes.total),90,`${disk.mount} · ${t('inodes')}`);
+    usageIn('hardware', percentage(disk.used, disk.total), thresholds.disk, `${disk.mount}`);
+    if (disk.inodes) usageIn('hardware', percentage(disk.inodes.used,disk.inodes.total),90,`${disk.mount} · ${t('inodes')}`);
+  }
+  if (data.reboot?.required) add(1, t('healthReboot'), 'system');
+  const failedUnits = data.failedUnits?.units || [];
+  if (failedUnits.length) add(1, `${t('healthFailedUnits')}${localeColon()}${failedUnits.slice(0,3).map(unit => unit.unit).join(', ')}${failedUnits.length > 3 ? '…' : ''}`, 'system');
+  for (const entry of (data.ports || []).filter(port => port.sensitive)) {
+    add(1, `${entry.service || entry.port} (${entry.port}) ${t('healthExposedPort')}`, 'network');
   }
   const swapping = Math.max(0, state.rates.swapIn || 0) + Math.max(0, state.rates.swapOut || 0);
-  if (swapping >= 100) add(2,`${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`);
-  else if (swapping >= 10) add(1,`${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`);
+  if (swapping >= 100) add(2,`${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`, 'processes');
+  else if (swapping >= 10) add(1,`${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`, 'processes');
   for (const [key, label] of [['memory','pressureMemory'],['io','pressureIo']]) {
     const p = data.pressure?.[key];
-    if (p && p.avg10 >= 30) add(2,`${t(label)} PSI${localeColon()}${pct(p.avg10)}`);
-    else if (p && p.avg10 >= 10) add(1,`${t(label)} PSI${localeColon()}${pct(p.avg10)}`);
+    if (p && p.avg10 >= 30) add(2,`${t(label)} PSI${localeColon()}${pct(p.avg10)}`, 'system');
+    else if (p && p.avg10 >= 10) add(1,`${t(label)} PSI${localeColon()}${pct(p.avg10)}`, 'system');
   }
   const tcpDown = (data.services || []).filter(s => !s.online);
-  if (tcpDown.length) add(1,`${t('services')}${localeColon()}${tcpDown.map(x=>x.name).slice(0,3).join(', ')}`);
+  if (tcpDown.length) add(1,`${t('services')}${localeColon()}${tcpDown.map(x=>x.name).slice(0,3).join(', ')}`, 'network');
   const httpDown = (data.httpChecks || []).filter(s => s.online === false && !s.stale);
   const realDown = httpDown.filter(s => !s.self);
   const selfDown = httpDown.filter(s => s.self);
-  if (realDown.length) add(2,`${t('httpChecks')}${localeColon()}${realDown.map(x=>x.name).slice(0,3).join(', ')}`);
-  if (selfDown.length) add(1, t('selfCheckNeedsConfig'));
+  if (realDown.length) add(2,`${t('httpChecks')}${localeColon()}${realDown.map(x=>x.name).slice(0,3).join(', ')}`, 'network');
+  if (selfDown.length) add(1, t('selfCheckNeedsConfig'), 'network');
   for (const check of data.httpChecks || []) {
     if (!check.stale && check.tlsDays !== null && check.tlsDays < 14 && check.online) {
-      add(check.tlsDays < 3 ? 2 : 1,`${check.name}${localeColon()}${t('tlsExpires')} ${number(check.tlsDays,0)} ${t('days')}`);
+      add(check.tlsDays < 3 ? 2 : 1,`${check.name}${localeColon()}${t('tlsExpires')} ${number(check.tlsDays,0)} ${t('days')}`, 'network');
     }
   }
   for (const link of data.network || []) {
     if (link.category !== 'physical') continue;
     const rate = state.rates.network[link.name];
     if (rate && ((rate.rxErrors || 0)+(rate.txErrors || 0) >= 1 || (rate.dropped || 0) >= 10)) {
-      add(1,`${link.name}${localeColon()}${t('networkErrors')}`);
+      add(1,`${link.name}${localeColon()}${t('networkErrors')}`, 'network');
     }
   }
   const panel = $('healthBanner');
@@ -3205,7 +4056,16 @@ function renderHealth(data) {
   setText('healthDescription',severity ? t('healthNeedsAttention') : t('healthAllClear'));
   const list = $('healthReasons');
   list.replaceChildren();
-  for (const reason of warnings.slice(0,5)) list.append(node('span','',`• ${reason}`));
+  for (const {reason, view} of warnings.slice(0,5)) {
+    const item = node('span','','• ');
+    if (view) {
+      const link = node('a','',reason);
+      link.href = '?view=' + view;
+      link.dataset.viewLink = view;
+      item.append(link);
+    } else item.append(document.createTextNode(reason));
+    list.append(item);
+  }
   if (warnings.length > 5) list.append(node('span','',`+${warnings.length-5}`));
   const swap = data.memory?.swap;
   if (!warnings.length && swap?.total > 0 && percentage(swap.used,swap.total) >= 50 && swapping < 1) {
@@ -3276,6 +4136,66 @@ function renderSystem(data) {
     row(t('swapOut'), speedPages(state.rates.swapOut)),
     row(t('apiDuration'), data.collectionMs == null ? null : number(data.collectionMs) + ' ms'),
   );
+  const reboot = data.reboot || {};
+  const reasons = [];
+  if ((reboot.reasons || []).includes('kernel')) {
+    reasons.push(t('rebootKernel').replace('{k}', reboot.latestKernel || '?').replace('{r}', reboot.runningKernel || '?'));
+  }
+  if (reboot.packages?.length) reasons.push(t('rebootPackages') + localeColon() + reboot.packages.slice(0, 5).join(', ') + (reboot.packages.length > 5 ? '…' : ''));
+  const rebootRow = row(t('rebootRequired'), reboot.required ? t('yes') + (reasons.length ? ' · ' + reasons.join(' · ') : '') : t('rebootNo'));
+  if (reboot.required) rebootRow.querySelector('.value').style.color = 'var(--warn)';
+  rows.prepend(rebootRow);
+}
+
+function renderChecks(data) {
+  const target = $('checksList');
+  target.replaceChildren();
+  const services = data.services || [];
+  const checks = data.httpChecks || [];
+  if (!services.length && !checks.length) { empty(target, t('noChecks')); return; }
+  const add = (name, status, label, detail = '') => {
+    const item = node('div', 'check-row');
+    const left = node('span', 'check-name', name);
+    if (detail) left.append(node('small', '', detail));
+    item.append(left, node('span', 'pill ' + status, label));
+    target.append(item);
+  };
+  for (const service of services) add(service.name, service.online ? 'up' : 'down', t(service.online ? 'onlineService' : 'offlineService'));
+  for (const check of checks) {
+    const status = check.online === null ? '' : (check.online ? 'up' : 'down');
+    const label = check.online === null ? t('httpPending') : t(check.online ? 'onlineService' : 'offlineService');
+    const tls = check.tls && Number.isFinite(check.tlsDays) ? `${t('tlsExpires')}${localeColon()}${number(check.tlsDays, 0)} ${t('days')}` : '';
+    add(check.self ? t('selfCheck') : check.name, status, label, tls);
+  }
+}
+function renderFailedUnits(data) {
+  const target = $('failedList');
+  target.replaceChildren();
+  const failed = data.failedUnits || {};
+  if (!failed.available) { empty(target, t('systemdUnavailable')); return; }
+  if (!failed.units?.length) { target.append(node('p', 'ok-message', '✓ ' + t('noFailedUnits'))); return; }
+  for (const unit of failed.units) {
+    const item = node('div', 'check-row');
+    const left = node('span', 'check-name', unit.unit);
+    if (unit.description) left.append(node('small', '', unit.description));
+    item.append(left, node('span', 'pill down', unit.sub || 'failed'));
+    target.append(item);
+  }
+}
+function renderPorts(data) {
+  const target = $('portsList');
+  target.replaceChildren();
+  const ports = data.ports || [];
+  if (!ports.length) { empty(target, t('noPorts')); return; }
+  for (const entry of ports) {
+    const item = node('div', 'check-row');
+    const left = node('span', 'check-name');
+    left.append(node('strong', '', String(entry.port)), document.createTextNode(entry.service ? ' · ' + entry.service : ''));
+    if (entry.sensitive) left.append(node('small', '', t('portSensitive')));
+    const scope = entry.scope === 'all' ? t('portScopeAll') : entry.scope === 'local' ? t('portScopeLocal') : entry.address;
+    item.append(left, node('span', 'pill ' + (entry.scope === 'local' ? 'up' : entry.sensitive ? 'warn' : ''), scope));
+    target.append(item);
+  }
 }
 
 function speedPages(value) {
@@ -3428,14 +4348,36 @@ function renderServices(data) {
 function renderHardware(data) {
   const target = $('hardwareList');
   const s = data.system || {};
-  target.replaceChildren(row(t('cpuModel'), s.cpuModel), row(t('cores'), s.logicalCores));
-  if (!data.temperatures?.length) {
-    target.append(row(t('temperature'), t('unknown')));
-    return;
+  const sockets = Number(s.cpuSockets) || 1;
+  target.replaceChildren(
+    row(t('cpuModel'), s.cpuModel ? (sockets > 1 ? `${sockets} × ${s.cpuModel}` : s.cpuModel) : null),
+    row(t('cores'), s.logicalCores),
+  );
+  if (Number.isFinite(s.physicalCores) && s.physicalCores !== s.logicalCores) target.append(row(t('physicalCores'), s.physicalCores));
+  const temps = data.temperatures || [];
+  const cpuCount = temps.filter(sensor => sensor.kind === 'cpu').length;
+  const labels = {cpu:'tempCpu', disk:'tempDisk', board:'tempBoard', chipset:'tempChipset', wifi:'tempWifi'};
+  if (!temps.length) target.append(row(t('temperature'), t('unknown')));
+  for (const sensor of temps) {
+    let label = labels[sensor.kind] ? t(labels[sensor.kind]) : (sensor.name || t('temperature'));
+    if (sensor.kind === 'cpu' && cpuCount > 1) label += ' ' + (Number(sensor.index) + 1);
+    if (sensor.kind === 'disk' && sensor.name) label += ' · ' + sensor.name;
+    target.append(row(label, number(sensor.celsius) + ' °C'));
   }
-  for (const sensor of data.temperatures) {
-    target.append(row(sensor.name, number(sensor.celsius) + ' °C'));
-  }
+  const gpus = data.gpus || [];
+  gpus.forEach((gpu, index) => {
+    const suffix = gpus.length > 1 ? ' ' + (index + 1) : '';
+    target.append(row(t('gpu') + suffix, gpu.name || t('unknown')));
+    if (Number.isFinite(gpu.busyPercent)) target.append(row(t('gpuUsage') + suffix, pct(gpu.busyPercent)));
+    if (Number.isFinite(gpu.vramTotal) && gpu.vramTotal > 0) {
+      target.append(row(t('gpuMemory') + suffix, (Number.isFinite(gpu.vramUsed) ? bytes(gpu.vramUsed) + ' / ' : '') + bytes(gpu.vramTotal)));
+    }
+    if (Number.isFinite(gpu.celsius)) target.append(row(t('gpuTemp') + suffix, number(gpu.celsius) + ' °C'));
+    if (Number.isFinite(gpu.watts)) target.append(row(t('gpuPower') + suffix, number(gpu.watts) + ' W'));
+    if (Number.isFinite(gpu.mhz)) {
+      target.append(row(t('gpuClock') + suffix, number(gpu.mhz, 0) + (Number.isFinite(gpu.maxMhz) ? ' / ' + number(gpu.maxMhz, 0) : '') + ' MHz'));
+    }
+  });
 }
 
 function renderPressure(data) {
@@ -3487,7 +4429,9 @@ function applyLanguage() {
   if (activeHelp && !helpPopover.hidden) showHelp(activeHelp,helpPinned);
   updateChartTitles();
   if ($('settingsDialog').open) renderPreferenceControls();
+  document.querySelectorAll('[data-i18n-title]').forEach(element => { element.title = t(element.dataset.i18nTitle); });
   if (state.latest) render(state.latest);
+  updateViewChrome();
   setText('connectionText', state.connected ? t('online') : (state.latest ? t('offline') : t('connecting')));
   if ($('errorBanner').classList.contains('show')) {
     $('errorBanner').textContent = t('refreshError') + ' (' + state.errorDetail + ')';
@@ -3496,7 +4440,7 @@ function applyLanguage() {
 function applyStyle() {
   document.documentElement.dataset.style = visualStyle;
   $('styleChoice').value = visualStyle;
-  document.querySelector('meta[name="color-scheme"]').content = visualStyle === 'operations' ? 'dark light' : 'light dark';
+  document.querySelector('meta[name="color-scheme"]').content = visualStyle === 'pro' ? 'light dark' : 'dark light';
 }
 $('language').addEventListener('change', event => {
   if (!words[event.target.value]) return;
@@ -3525,37 +4469,41 @@ let dashboardMeasured = false;
 const panelHeights = {};
 const panelWeights = {
   activity:2.8, system:1.3, processes:1.8, network:2.0, storage:1.9,
-  http:1.0, services:1.0, hardware:.8, pressure:.8,
+  http:1.0, services:1.0, hardware:1.2, pressure:.8, checks:1.0, failed:.6, ports:1.6,
 };
 function layoutDashboard(force = false) {
   const dashboard = document.querySelector('.dashboard');
-  const width = dashboard.clientWidth;
-  const count = width >= 1940 ? 4 : width >= 1340 ? 3 : width >= 790 ? 2 : 1;
+  const width = dashboard.clientWidth || document.querySelector('.wrap').clientWidth;
+  const groups = currentView === 'overview' ? panelOrder : pageGroups[currentView];
+  const panelCount = groups.left.length + groups.right.length;
+  const count = Math.max(1, Math.min(panelCount, width >= 1940 ? 4 : width >= 1340 ? 3 : width >= 790 ? 2 : 1));
   if (!force && count === currentDashboardColumns) return;
   currentDashboardColumns = count;
   dashboard.style.setProperty('--dashboard-cols', String(count));
   const columns = Array.from({length:count}, () => node('div','column'));
   const targetLists = Array.from({length:count}, () => []);
-  if (count === 1) targetLists[0].push(...panelOrder.left, ...panelOrder.right);
+  if (count === 1) targetLists[0].push(...groups.left, ...groups.right);
   else if (count === 2) {
-    targetLists[0].push(...panelOrder.left);
-    targetLists[1].push(...panelOrder.right);
+    targetLists[0].push(...groups.left);
+    targetLists[1].push(...groups.right);
   } else {
     const totalHeight = Array(count).fill(0);
     const ordered = [];
-    const longest = Math.max(panelOrder.left.length, panelOrder.right.length);
+    const longest = Math.max(groups.left.length, groups.right.length);
     for (let i = 0; i < longest; i++) {
-      if (panelOrder.left[i]) ordered.push(panelOrder.left[i]);
-      if (panelOrder.right[i]) ordered.push(panelOrder.right[i]);
+      if (groups.left[i]) ordered.push(groups.left[i]);
+      if (groups.right[i]) ordered.push(groups.right[i]);
     }
     for (const id of ordered) {
       const minHeight = Math.min(...totalHeight);
       const index = totalHeight.indexOf(minHeight);
       targetLists[index].push(id);
-      totalHeight[index] += hiddenPanels.has(id) ? 0.01 : (panelHeights[id] ?? panelWeights[id] ?? 1);
+      totalHeight[index] += (currentView === 'overview' && hiddenPanels.has(id)) ? 0.01 : (panelHeights[id] ?? panelWeights[id] ?? 1);
     }
   }
-  const panels = new Map(Object.keys(panelLabels).map(id => [id, $('panel-' + id)]));
+  const panels = new Map(allPanels.map(id => [id, $('panel-' + id)]));
+  const store = $('panelStore');
+  for (const panel of panels.values()) store.append(panel); // panels of other pages wait here, hidden
   for (let i = 0; i < count; i++) {
     for (const id of targetLists[i]) columns[i].append(panels.get(id));
   }
@@ -3582,11 +4530,13 @@ function applyPreferences() {
   $('refreshInterval').value = String(refreshSeconds);
   $('graphPeriod').value = String(graphMinutes);
   for (const [name, value] of Object.entries(thresholds)) $('warn' + name[0].toUpperCase() + name.slice(1)).value = String(value);
-  for (const name of Object.keys(panelLabels)) $('panel-' + name).hidden = hiddenPanels.has(name);
+  for (const name of allPanels) $('panel-' + name).hidden = currentView === 'overview' && hiddenPanels.has(name);
   for (const name of Object.keys(chartKeys)) {
     const card = document.querySelector(`[data-chart-card="${name}"]`);
     if (card) card.hidden = hiddenCharts.has(name);
   }
+  $('siteFooter').hidden = !showFooter;
+  $('showFooter').checked = showFooter;
   dashboardMeasured = false;
   layoutDashboard(true);
   updateChartTitles();
@@ -3670,13 +4620,18 @@ for (const name of ['cpu','ram','disk']) {
     if (state.latest) renderHealth(state.latest);
   });
 }
+$('showFooter').addEventListener('change', event => {
+  showFooter = event.target.checked;
+  saveSetting('mmsShowFooter', showFooter ? '1' : '0');
+  applyPreferences();
+});
 $('resetSettings').addEventListener('click', () => {
-  refreshSeconds = <?= (int) $refresh ?>; graphMinutes = 3;
+  refreshSeconds = <?= (int) $refresh ?>; graphMinutes = 3; showFooter = true;
   Object.assign(thresholds,{cpu:85,ram:85,disk:85});
   hiddenPanels.clear(); hiddenCharts.clear();
   panelOrder={left:[...panelGroups.left],right:[...panelGroups.right]};
   for (const key of ['esm32Refresh','esm32Period','esm32WarnCpu','esm32WarnRam','esm32WarnDisk',
-    'esm32HiddenPanels','esm32HiddenCharts','esm32Order']) {
+    'esm32HiddenPanels','esm32HiddenCharts','esm32Order','mmsShowFooter']) {
     try { localStorage.removeItem(key); } catch {  }
   }
   applyPreferences(); renderPreferenceControls(); setRefresh();
@@ -3699,24 +4654,45 @@ function render(data) {
   renderSummary(data);
   renderHealth(data);
   renderSystem(data);
-  renderProcesses(data);
   renderHttp(data);
   renderCores();
   renderDisks(data);
   renderDiskIo(data);
   renderNetwork(data);
   renderServices(data);
-  renderHardware(data);
   renderPressure(data);
+  renderChecks(data);
+  renderFailedUnits(data);
+  renderPorts(data);
+  // Modules collected only for one page: render them only when they belong to the page shown.
+  if (data.view === currentView && data.processes) {
+    if (currentView === 'processes') renderProcessDetail(data); else renderProcesses(data);
+  }
+  if (data.view === currentView && Array.isArray(data.temperatures)) renderHardware(data);
   renderCharts();
   if (!dashboardMeasured && currentDashboardColumns >= 3) requestAnimationFrame(rebalanceDashboardOnce);
 }
 
+function showOnline() {
+  $('connectionDot').className = 'dot ok';
+  state.connected = true;
+  state.errorDetail = '';
+  setText('connectionText', t('online'));
+  $('errorBanner').classList.remove('show');
+}
+function showOffline(error) {
+  $('connectionDot').className = 'dot error';
+  state.connected = false;
+  setText('connectionText', t('offline'));
+  state.errorDetail = String(error?.message || 'error');
+  $('errorBanner').textContent = t('refreshError') + ' (' + state.errorDetail + ')';
+  $('errorBanner').classList.add('show');
+}
 async function poll() {
-  if (state.busy || !state.active) return;
+  if (state.busy || !state.active) { if (state.busy) state.repoll = true; return; }
   state.busy = true;
   try {
-    const response = await fetch(location.pathname + '?api=stats', {
+    const response = await fetch(location.pathname + '?api=stats&view=' + encodeURIComponent(currentView), {
       cache: 'no-store', credentials: 'same-origin',
     });
     if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -3735,21 +4711,13 @@ async function poll() {
     state.historyTimes.push(Number(data.sampleTimeMs) || Date.now());
     if (state.historyTimes.length > HISTORY_LIMIT) state.historyTimes.shift();
     render(data);
-    $('connectionDot').className = 'dot ok';
-    state.connected = true;
-    state.errorDetail = '';
-    setText('connectionText', t('online'));
-    $('errorBanner').classList.remove('show');
+    showOnline();
   } catch (error) {
-    $('connectionDot').className = 'dot error';
-    state.connected = false;
-    setText('connectionText', t('offline'));
-    state.errorDetail = String(error?.message || 'error');
-    $('errorBanner').textContent = t('refreshError') + ' (' + state.errorDetail + ')';
-    $('errorBanner').classList.add('show');
+    showOffline(error);
     state.previous = null;
   } finally {
     state.busy = false;
+    if (state.repoll) { state.repoll = false; poll(); }
   }
 }
 
@@ -3811,6 +4779,40 @@ document.addEventListener('visibilitychange', () => {
     poll();
   }
 });
+function updateViewChrome() {
+  document.documentElement.dataset.view = currentView;
+  for (const link of document.querySelectorAll('#viewTabs a')) {
+    if (link.dataset.viewLink === currentView) {
+      link.setAttribute('aria-current', 'page');
+      const tabs = $('viewTabs');
+      if (tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = Math.max(0, link.offsetLeft - tabs.offsetLeft - 16);
+    } else link.removeAttribute('aria-current');
+  }
+  document.title = currentView === 'overview' ? PAGE_TITLE : t(VIEW_LABELS[currentView]) + ' · ' + PAGE_TITLE;
+}
+function switchView(view, push = true) {
+  if (!VIEWS.includes(view)) view = 'overview';
+  if (push) history.pushState({view}, '', '?view=' + view);
+  if (view === currentView) return;
+  currentView = view;
+  updateViewChrome();
+  dashboardMeasured = false;
+  applyPreferences();
+  window.scrollTo(0, 0);
+  if (state.latest) render(state.latest);
+  requestAnimationFrame(() => rebalanceDashboardOnce());
+  poll();
+}
+document.addEventListener('click', event => {
+  const link = event.target.closest?.('a[data-view-link]');
+  if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  switchView(link.dataset.viewLink);
+});
+window.addEventListener('popstate', () => {
+  switchView(new URLSearchParams(location.search).get('view') || 'overview', false);
+});
+updateViewChrome();
 applyStyle();
 applyPreferences();
 applyLanguage();
