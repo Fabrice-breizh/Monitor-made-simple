@@ -1,6 +1,6 @@
 <?php
 /**
- * Monitor made Simple 1.2.1 — single-file Linux monitoring dashboard.
+ * Monitor made Simple 1.3.0 — single-file Linux monitoring dashboard.
  * PHP 8.1+, no external assets or database.
  * HTTP Basic authentication is mandatory for the page and JSON API.
  */
@@ -11,7 +11,9 @@ declare(strict_types=1);
 // =============================================================
 const ESM_TITLE = 'Monitor made Simple';
 const ESM_REFRESH_SECONDS = 5;
-const ESM_AUTH_USER = 'admin';
+// Refresh interval while the browser tab is in the background (0 = pause until the tab is shown again).
+const ESM_BACKGROUND_REFRESH_SECONDS = 30;
+const ESM_AUTH_USER = 'fabricebreizh';
 // true = refuse plain HTTP (HTTPS, or a reverse proxy sending X-Forwarded-Proto: https, is required).
 const ESM_REQUIRE_HTTPS = false;
 // Behind a reverse proxy that terminates HTTPS: set to true so its X-Forwarded-Proto header is
@@ -21,7 +23,7 @@ const ESM_TRUSTED_PROXIES = ['127.0.0.1', '::1'];
 
 // Set a password hash via the ESM_PASSWORD_HASH environment variable (recommended),
 // or paste a password_hash() result below. Never store a plaintext password here.
-const ESM_PASSWORD_HASH = '';
+const ESM_PASSWORD_HASH = '$2y$12$00x7Ygt9C2SEAIv1XlcByeltX2DEjU.TFasUsvU4BSsMdnhmmvlM2';
 // No hash means HTTP 401 for every request, including the JSON API.
 // Never bypass authentication based on REMOTE_ADDR: reverse proxies may use loopback.
 
@@ -77,7 +79,7 @@ function esmNonce(): string
 }
 
 header('X-Content-Type-Options: nosniff');
-header('X-Monitor-Made-Simple: 1.2.1');
+header('X-Monitor-Made-Simple: 1.3.0');
 header('Referrer-Policy: no-referrer');
 header('X-Frame-Options: DENY');
 header('Cache-Control: private, no-store, max-age=0');
@@ -1319,7 +1321,7 @@ function esmHttpProbe(array $item): ?array
     }
     $defaultPort = $tls ? 443 : 80;
     $request = "GET " . $path . " HTTP/1.1\r\nHost: " . $hostname . ($port !== $defaultPort ? ':' . $port : '')
-        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/1.2.1\r\nAccept: */*\r\n\r\n";
+        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/1.3.0\r\nAccept: */*\r\n\r\n";
     stream_set_blocking($client, false);
     $pending = $request;
     $headers = '';
@@ -1409,7 +1411,7 @@ if (isset($_GET['api'])) {
         $payload = [
             'ok' => true,
             'view' => $apiView,
-            'version' => '1.2.1',
+            'version' => '1.3.0',
             'sampleTimeMs' => round(microtime(true) * 1000),
             'system' => esmSafeCollect('system', 'esmSystem', []),
             'cpu' => esmSafeCollect('cpu', 'esmCpu', ['total'=>null, 'idle'=>null, 'cores'=>[]]),
@@ -1900,16 +1902,11 @@ button.control:active { transform:translateY(1px); }
   .style-picker select {min-width:108px;}
 }
 
-[data-style="operations"] body {background-image:linear-gradient(180deg,#101d2d 0%,var(--bg) 440px);background-attachment:fixed;}
+[data-style="operations"] body {background-image:none;}
 [data-style="operations"] .header {border-radius:13px;background:#152235;border:1px solid #344960;}
 [data-style="operations"] .metric,[data-style="operations"] .panel {border-radius:12px;}
-[data-style="operations"] .metric {border-top:2px solid #334d60;}
+[data-style="operations"] .metric {border-top:1px solid var(--border);}
 [data-style="operations"] .metric::before {width:0;}
-[data-style="operations"] .metric:nth-child(1) {border-top-color:#55c7db;}
-[data-style="operations"] .metric:nth-child(2) {border-top-color:#6aceaf;}
-[data-style="operations"] .metric:nth-child(3) {border-top-color:#f0b66c;}
-[data-style="operations"] .metric:nth-child(4) {border-top-color:#a6a4ef;}
-[data-style="operations"] .metric:nth-child(5) {border-top-color:#718aa4;}
 [data-style="operations"] .big {font-variant-numeric:tabular-nums;letter-spacing:-.06em;}
 [data-style="operations"] .chart-card {border-radius:7px;}
 [data-style="operations"] .process-item,[data-style="operations"] .item {border-radius:6px;}
@@ -1933,16 +1930,11 @@ button.control:active { transform:translateY(1px); }
 [data-style="pro"] .metric:hover {transform:none;box-shadow:none;}
 
 /* "Dusk": the night style, lightened */
-[data-style="zen"] body {background-image:linear-gradient(180deg,#30455e 0%,var(--bg) 440px);background-attachment:fixed;}
+[data-style="zen"] body {background-image:none;}
 [data-style="zen"] .header {border-radius:13px;background:#33495f;border:1px solid #5a7390;}
 [data-style="zen"] .metric,[data-style="zen"] .panel {border-radius:12px;}
-[data-style="zen"] .metric {border-top:2px solid #557089;}
+[data-style="zen"] .metric {border-top:1px solid var(--border);}
 [data-style="zen"] .metric::before {width:0;}
-[data-style="zen"] .metric:nth-child(1) {border-top-color:#6fd3e6;}
-[data-style="zen"] .metric:nth-child(2) {border-top-color:#7fdcbf;}
-[data-style="zen"] .metric:nth-child(3) {border-top-color:#f3c27f;}
-[data-style="zen"] .metric:nth-child(4) {border-top-color:#b5b3f4;}
-[data-style="zen"] .metric:nth-child(5) {border-top-color:#8ca3bb;}
 [data-style="zen"] .big {font-variant-numeric:tabular-nums;letter-spacing:-.06em;}
 [data-style="zen"] .chart-card {border-radius:7px;}
 [data-style="zen"] .process-item,[data-style="zen"] .item {border-radius:6px;}
@@ -2013,6 +2005,31 @@ html:not([data-view="overview"]) .summary { display:none !important; }
   .site-footer { padding:8px 12px; border-radius:18px; font-size:.82rem; row-gap:5px; }
   .site-footer .footer-text { width:100%; text-align:center; }
 }
+
+/* 1.3.0: quieter tiles, charts that can be read without hovering */
+.metric-symbol { display:none !important; }
+.big { font-variant-numeric:tabular-nums; white-space:nowrap; }
+.metric .tiny { font-size:.72rem; opacity:.85; }
+.progress > i { background:var(--muted); }
+.progress > i.warn { background:var(--warn); }
+.progress > i.bad { background:var(--bad); }
+.metric:hover { transform:none !important; }
+.chart-box { position:relative; }
+.chart-overlay { position:absolute; inset:0; pointer-events:none; font-size:.64rem; color:var(--muted); }
+.chart-scale { position:absolute; top:3px; left:6px; opacity:.8; font-variant-numeric:tabular-nums; }
+.chart-threshold { position:absolute; right:6px; transform:translateY(-118%); color:var(--warn); font-weight:650; white-space:nowrap; }
+.chart-dot { position:absolute; width:8px; height:8px; margin:-4px 0 0 -4px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 2px var(--surface); }
+.chart-dot.second { background:var(--good); }
+.chart-threshold-line { stroke:var(--warn); }
+.chart-axis { display:flex; justify-content:space-between; margin:4px 1px 0; font-size:.63rem; color:var(--muted); font-variant-numeric:tabular-nums; }
+.chart-card .chart-stats, .zoom-dialog .chart-stats { display:flex; flex-wrap:wrap; align-items:baseline; gap:2px 10px; margin:0 1px 6px; font-size:.7rem; color:var(--muted); }
+.chart-stats strong { color:var(--text); font-size:1.02rem; font-weight:720; font-variant-numeric:tabular-nums; }
+.chart-pair { display:inline-flex; align-items:baseline; gap:3px; }
+.chart-pair i { display:inline-block; width:9px; height:3px; border-radius:3px; background:var(--accent); transform:translateY(-3px); }
+.chart-pair.second i { background:var(--good); }
+.chart-pair strong { font-size:.9rem; }
+.zoom-dialog .chart-stats strong { font-size:1.3rem; }
+[data-style="operations"], [data-style="zen"] { --shadow:none; }
 </style>
 </head>
 <body>
@@ -2103,23 +2120,23 @@ html:not([data-view="overview"]) .summary { display:none !important; }
           <div class="charts">
             <div class="chart-card" data-chart-card="cpu">
               <div class="chart-title"><span class="chart-label" data-i18n="cpuGraph">CPU · last 3 min</span><button type="button" class="chart-expand" data-chart="cpu" aria-label="Expand graph" title="Expand graph">⤢</button></div>
-              <svg id="cpuChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg><div class="chart-stats" id="cpuStats"></div>
+              <div class="chart-stats" id="cpuStats"></div><div class="chart-box"><svg id="cpuChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg></div><div class="chart-axis" aria-hidden="true"></div>
             </div>
             <div class="chart-card" data-chart-card="ram">
               <div class="chart-title"><span class="chart-label" data-i18n="memoryGraph">RAM · last 3 min</span><button type="button" class="chart-expand" data-chart="ram" aria-label="Expand graph" title="Expand graph">⤢</button></div>
-              <svg id="ramChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg><div class="chart-stats" id="ramStats"></div>
+              <div class="chart-stats" id="ramStats"></div><div class="chart-box"><svg id="ramChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg></div><div class="chart-axis" aria-hidden="true"></div>
             </div>
             <div class="chart-card" data-chart-card="swap">
               <div class="chart-title"><span class="chart-label" data-i18n="swapGraph">Swap · last 3 min</span><button type="button" class="chart-expand" data-chart="swap" aria-label="Expand graph" title="Expand graph">⤢</button></div>
-              <svg id="swapChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg><div class="chart-stats" id="swapStats"></div>
+              <div class="chart-stats" id="swapStats"></div><div class="chart-box"><svg id="swapChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg></div><div class="chart-axis" aria-hidden="true"></div>
             </div>
             <div class="chart-card" data-chart-card="net">
               <div class="chart-title"><span data-i18n="networkGraph">Network traffic</span><span class="legend"><span><i></i><span data-i18n="rx">Rx</span></span><span><i class="second"></i><span data-i18n="tx">Tx</span></span></span><button type="button" class="chart-expand" data-chart="net" aria-label="Expand graph" title="Expand graph">⤢</button></div>
-              <svg id="netChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg><div class="chart-stats" id="netStats"></div>
+              <div class="chart-stats" id="netStats"></div><div class="chart-box"><svg id="netChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg></div><div class="chart-axis" aria-hidden="true"></div>
             </div>
             <div class="chart-card" data-chart-card="io">
               <div class="chart-title"><span data-i18n="diskGraph">Disk I/O</span><span class="legend"><span><i></i><span data-i18n="read">Read</span></span><span><i class="second"></i><span data-i18n="write">Write</span></span></span><button type="button" class="chart-expand" data-chart="io" aria-label="Expand graph" title="Expand graph">⤢</button></div>
-              <svg id="ioChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg><div class="chart-stats" id="ioStats"></div>
+              <div class="chart-stats" id="ioStats"></div><div class="chart-box"><svg id="ioChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg></div><div class="chart-axis" aria-hidden="true"></div>
             </div>
           </div>
           <div class="help-cluster"><button type="button" class="help-button" data-help="historyNote" aria-label="Help">?</button></div>
@@ -2261,11 +2278,11 @@ html:not([data-view="overview"]) .summary { display:none !important; }
     </dialog>
     <dialog class="dialog zoom-dialog" id="chartDialog" aria-labelledby="zoomTitle">
       <div class="dialog-head"><h2 id="zoomTitle">—</h2><button type="button" class="control" id="closeChart" aria-label="Close">×</button></div>
-      <svg id="zoomChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg>
+      <div class="chart-stats" id="zoomStats"></div><div class="chart-box"><svg id="zoomChart" class="chart" viewBox="0 0 400 100" preserveAspectRatio="none" role="img"></svg></div><div class="chart-axis" aria-hidden="true"></div>
       <div class="help-cluster"><button type="button" class="help-button" data-help="historyNote" aria-label="Help">?</button></div>
     </dialog>
 
-    <footer class="foot">Monitor made Simple 1.2.1 · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
+    <footer class="foot">Monitor made Simple 1.3.0 · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
     <footer class="site-footer" id="siteFooter" aria-label="Source code and support">
       <span class="footer-text" data-i18n="footerSource">Source code and support:</span>
       <a href="https://github.com/Fabrice-breizh" target="_blank" rel="noopener noreferrer">GitHub</a>
@@ -2334,6 +2351,8 @@ const words = {
     "moveUp": "Move up",
     "moveDown": "Move down",
     "resetSettings": "Reset preferences",
+    "threshold": "Threshold",
+    "axisNow": "now",
     "connectionRefused": "Connection refused (nothing is listening on this port)",
     "httpTimeout": "No answer in time (timeout)",
     "tlsCertificateError": "TLS certificate rejected (expired, self-signed or wrong name)",
@@ -2548,6 +2567,8 @@ const words = {
     "moveUp": "Monter",
     "moveDown": "Descendre",
     "resetSettings": "Réinitialiser les préférences",
+    "threshold": "Seuil",
+    "axisNow": "maintenant",
     "connectionRefused": "Connexion refusée (aucun service n'écoute sur ce port)",
     "httpTimeout": "Pas de réponse à temps (délai dépassé)",
     "tlsCertificateError": "Certificat TLS refusé (expiré, auto-signé ou nom incorrect)",
@@ -2762,6 +2783,8 @@ const words = {
     "moveUp": "Subir",
     "moveDown": "Bajar",
     "resetSettings": "Restablecer preferencias",
+    "threshold": "Umbral",
+    "axisNow": "ahora",
     "connectionRefused": "Conexión rechazada (ningún servicio escucha en este puerto)",
     "httpTimeout": "Sin respuesta a tiempo (tiempo de espera agotado)",
     "tlsCertificateError": "Certificado TLS rechazado (caducado, autofirmado o nombre incorrecto)",
@@ -2976,6 +2999,8 @@ const words = {
     "moveUp": "上移",
     "moveDown": "下移",
     "resetSettings": "恢复默认设置",
+    "threshold": "阈值",
+    "axisNow": "现在",
     "connectionRefused": "连接被拒绝（此端口没有服务在监听）",
     "httpTimeout": "未及时响应（超时）",
     "tlsCertificateError": "TLS 证书被拒绝（已过期、自签名或名称不符）",
@@ -3190,6 +3215,8 @@ const words = {
     "moveUp": "ऊपर ले जाएँ",
     "moveDown": "नीचे ले जाएँ",
     "resetSettings": "सेटिंग्स रीसेट करें",
+    "threshold": "सीमा",
+    "axisNow": "अभी",
     "connectionRefused": "कनेक्शन अस्वीकृत (इस पोर्ट पर कोई सेवा नहीं सुन रही)",
     "httpTimeout": "समय पर उत्तर नहीं (टाइमआउट)",
     "tlsCertificateError": "TLS प्रमाणपत्र अस्वीकृत (समाप्त, स्व-हस्ताक्षरित या गलत नाम)",
@@ -3404,6 +3431,8 @@ const words = {
     "moveUp": "上へ",
     "moveDown": "下へ",
     "resetSettings": "設定を初期化",
+    "threshold": "しきい値",
+    "axisNow": "現在",
     "connectionRefused": "接続が拒否されました（このポートで待ち受けているサービスがありません）",
     "httpTimeout": "時間内に応答がありません（タイムアウト）",
     "tlsCertificateError": "TLS 証明書が拒否されました（期限切れ、自己署名、または名前の不一致）",
@@ -3582,6 +3611,7 @@ const pageGroups = {
   processes: {left:[], right:[]},
 };
 const PROCESS_REFRESH_SECONDS = <?= (int) ESM_PROCESS_CACHE_SECONDS ?>;
+const BACKGROUND_REFRESH_SECONDS = <?= max(0, (int) ESM_BACKGROUND_REFRESH_SECONDS) ?>;
 const PAGE_TITLE = document.title;
 const styles = ['operations', 'pro', 'zen'];
 const HISTORY_LIMIT = 600;
@@ -3724,10 +3754,10 @@ function makeBar(value) {
   track.append(fill);
   return track;
 }
-function updateBar(id, value) {
+function updateBar(id, value, threshold = 85) {
   const fill = $(id);
   fill.style.width = (value ?? 0) + '%';
-  fill.className = value >= 90 ? 'bad' : value >= 75 ? 'warn' : '';
+  fill.className = value >= Math.min(99, threshold + 10) ? 'bad' : value >= threshold ? 'warn' : '';
 }
 function appendHistory(key, value) {
   state.history[key].push(Number.isFinite(value) ? value : null);
@@ -3867,7 +3897,7 @@ function showChartSample(id, index, pointer = null) {
   data.hit.dataset.point = String(sample);
   data.hit.setAttribute('aria-valuenow',String(sample));
   data.hit.setAttribute('aria-label',(data.label || id) + ' · ' + chartSampleText(data,sample));
-  const x = count === 1 ? 200 : sample * 400 / (count-1);
+  const x = data.xs?.[sample] ?? (count === 1 ? 200 : sample * 400 / (count-1));
   data.guide.setAttribute('x1',String(x));
   data.guide.setAttribute('x2',String(x));
   data.guide.style.display = '';
@@ -3893,12 +3923,50 @@ function hideChartTip(id = null) {
   if (activeChart && chartData[activeChart]) chartData[activeChart].guide.style.display = 'none';
   activeChart = null;
 }
-function plot(id, series, scale = 100, key = 'cpu') {
+const CHART_TOP = 8, CHART_BOTTOM = 96;
+function chartY(value, max) {
+  return CHART_BOTTOM - Math.max(0, Math.min(1, value / max)) * (CHART_BOTTOM - CHART_TOP);
+}
+function chartWindow(times) {
+  const end = times.length ? times[times.length - 1] : Date.now();
+  const span = graphMinutes * 60000;
+  return {start: end - span, span};
+}
+function chartX(time, win) {
+  return Math.max(0, Math.min(400, (time - win.start) / win.span * 400));
+}
+function agoLabel(seconds) {
+  const minutes = Math.floor(seconds / 60), rest = Math.round(seconds % 60);
+  if (!minutes) return `-${rest} s`;
+  return rest ? `-${minutes} min ${rest} s` : `-${minutes} min`;
+}
+function chartThreshold(key) {
+  return key === 'cpu' ? thresholds.cpu : key === 'ram' ? thresholds.ram : null;
+}
+function chartHeadline(target, series, key) {
+  if (!target) return;
+  const formatter = ['net','io'].includes(key) ? speed : pct;
+  const last = values => { const finite = values.filter(Number.isFinite); return finite.length ? finite[finite.length-1] : null; };
+  const peak = values => { const finite = values.filter(Number.isFinite); return finite.length ? Math.max(...finite) : null; };
+  const show = value => value == null ? '—' : formatter(value);
+  target.replaceChildren();
+  if (series.length === 1) {
+    target.append(node('strong','',show(last(series[0]))), node('span','chart-peak',`${t('maxValue')} ${show(peak(series[0]))}`));
+    return;
+  }
+  series.forEach((values, index) => {
+    const pair = node('span','chart-pair' + (index ? ' second' : ''));
+    pair.append(node('i'), document.createTextNode(index ? '↑ ' : '↓ '), node('strong','',show(last(values))));
+    target.append(pair);
+  });
+  target.append(node('span','chart-peak',`${t('maxValue')} ↓ ${show(peak(series[0]))} · ↑ ${show(peak(series[1]))}`));
+}
+function plot(id, series, scale = 100, key = 'cpu', threshold = null) {
   const svg = $(id);
   let data = chartData[id];
   if (!data) {
     const drawing = svgEl('g');
-    const guide = svgEl('line',{x1:0,x2:0,y1:17,y2:95,stroke:'var(--accent)','stroke-width':1.5,'stroke-dasharray':'3 3'});
+    const guide = svgEl('line',{x1:0,x2:0,y1:0,y2:100,stroke:'var(--accent)','stroke-width':1.5,'stroke-dasharray':'3 3','vector-effect':'non-scaling-stroke'});
     guide.style.display = 'none';
     const hit = svgEl('rect',{x:0,y:0,width:400,height:100,fill:'transparent',tabindex:0,role:'slider','aria-valuemin':0,'aria-valuemax':100});
     hit.addEventListener('pointermove',event => {
@@ -3907,8 +3975,11 @@ function plot(id, series, scale = 100, key = 'cpu') {
       const n = Math.max(0,...(chartData[id]?.series || []).map(v=>v.length));
       if (!n) return;
       chartData[id].lastPointer = {clientX:event.clientX,clientY:event.clientY};
-      const fraction = Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width));
-      showChartSample(id,Math.round(fraction*(n-1)),event);
+      const target = Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width)) * 400;
+      const xs = chartData[id].xs || [];
+      let nearest = n - 1, distance = Infinity;
+      xs.forEach((x, i) => { const d = Math.abs(x - target); if (d < distance) { distance = d; nearest = i; } });
+      showChartSample(id,nearest,event);
     });
     hit.addEventListener('pointerleave',()=>{chartData[id].lastPointer=null;hideChartTip(id);});
     hit.addEventListener('focus',()=> {
@@ -3928,7 +3999,9 @@ function plot(id, series, scale = 100, key = 'cpu') {
       showChartSample(id,index);
     });
     svg.append(drawing,guide,hit);
-    data = chartData[id] = {svg,drawing,guide,hit,lastPointer:null};
+    const overlay = node('div','chart-overlay');
+    svg.parentElement.append(overlay);
+    data = chartData[id] = {svg,drawing,guide,hit,overlay,lastPointer:null};
   }
   const count = Math.max(0,...series.map(values=>values.length));
   data.series = series;
@@ -3939,29 +4012,60 @@ function plot(id, series, scale = 100, key = 'cpu') {
   data.hit.setAttribute('aria-valuemax',String(Math.max(0,count-1)));
   if (Number(data.hit.dataset.point) >= count) data.hit.dataset.point = String(Math.max(0,count-1));
   data.drawing.replaceChildren();
-  for (const y of [25,50,75]) data.drawing.append(svgEl('line',{x1:0,x2:400,y1:y,y2:y,stroke:'currentColor',opacity:'.12'}));
+  data.overlay.replaceChildren();
   const valid = series.flat().filter(v=>Number.isFinite(v));
   const max = scale === 'auto' ? Math.max(1,...valid)*1.12 : scale;
-  const legend = svgEl('text',{x:394,y:13,'text-anchor':'end','font-size':11,fill:'currentColor',opacity:'.65'});
-  legend.textContent = valid.length ? (scale === 'auto' ? speed(max) : '100 %') : '—';
-  data.drawing.append(legend);
+  // Horizontal position = real sample time inside the selected period, so the time axis is exact
+  // (a young history only fills the right side; a pause, e.g. a hidden tab, leaves a gap).
+  const win = chartWindow(data.times);
+  const xs = data.times.map(time => chartX(time, win));
+  data.xs = xs;
+  const expected = refreshSeconds * 1000;
+  // Background tabs are refreshed slowly (and browsers may slow them down to once a minute).
+  const allowed = Math.max(3 * expected, expected + 4000, BACKGROUND_REFRESH_SECONDS > 0 ? Math.max(BACKGROUND_REFRESH_SECONDS * 2000, 65000) : 0);
+  const gap = i => i > 0 && data.times[i] - data.times[i-1] > allowed;  for (const fraction of [.25,.5,.75]) {
+    const y = chartY(fraction * max, max);
+    data.drawing.append(svgEl('line',{x1:0,x2:400,y1:y,y2:y,stroke:'currentColor',opacity:'.1','vector-effect':'non-scaling-stroke'}));
+  }
+  data.overlay.append(node('span','chart-scale',valid.length ? (scale === 'auto' ? speed(max) : '100 %') : ''));
+  if (Number.isFinite(threshold) && scale !== 'auto') {
+    // Same projection as the curve: the line stays right whatever the vertical scale.
+    const y = chartY(threshold, max);
+    data.drawing.append(svgEl('line',{x1:0,x2:400,y1:y,y2:y,class:'chart-threshold-line','stroke-width':1.3,'stroke-dasharray':'5 4','vector-effect':'non-scaling-stroke'}));
+    const label = node('span','chart-threshold',`${t('threshold')} ${number(threshold,0)} %`);
+    label.style.top = y + '%';
+    data.overlay.append(label);
+  }
   series.forEach((values,index)=> {
-    let segment = '';
-    const paths = [];
+    const color = index === 0 ? 'var(--accent)' : 'var(--good)';
+    const segments = [];
+    let current = [];
     values.forEach((value,i)=> {
-      if (!Number.isFinite(value)) {if (segment) paths.push(segment); segment=''; return;}
-      const x = values.length === 1 ? 200 : i*400/(values.length-1);
-      const y = 94-Math.max(0,Math.min(1,value/max))*85;
-      segment += (segment ? ' L ' : 'M ')+x.toFixed(1)+' '+y.toFixed(1);
+      if (!Number.isFinite(value) || gap(i)) { if (current.length) segments.push(current); current = []; }
+      if (Number.isFinite(value)) current.push([xs[i] ?? 400, chartY(value, max)]);
     });
-    if (segment) paths.push(segment);
-    const finite = values.map((value,i)=>({value,i})).filter(v=>Number.isFinite(v.value));
-    if (finite.length===1) {
-      const v=finite[0];
-      data.drawing.append(svgEl('circle',{cx:values.length===1?200:v.i*400/(values.length-1),cy:94-Math.max(0,Math.min(1,v.value/max))*85,r:3,fill:index===0?'var(--accent)':'var(--good)'}));
+    if (current.length) segments.push(current);
+    for (const points of segments) {
+      if (points.length === 1) continue;
+      const line = points.map(([x,y],k) => (k ? 'L ' : 'M ') + x.toFixed(1) + ' ' + y.toFixed(1)).join(' ');
+      const area = line + ` L ${points.at(-1)[0].toFixed(1)} ${CHART_BOTTOM} L ${points[0][0].toFixed(1)} ${CHART_BOTTOM} Z`;
+      data.drawing.append(svgEl('path',{d:area,fill:color,opacity:index === 0 ? '.13' : '.09',stroke:'none'}));
+      data.drawing.append(svgEl('path',{d:line,fill:'none',stroke:color,'stroke-width':2.2,'stroke-linejoin':'round','vector-effect':'non-scaling-stroke'}));
     }
-    for (const part of paths) data.drawing.append(svgEl('path',{d:part,fill:'none',stroke:index===0?'var(--accent)':'var(--good)','stroke-width':2.5,'stroke-linejoin':'round','vector-effect':'non-scaling-stroke'}));
+    // Latest measurement: an HTML dot, so it stays round although the SVG is stretched.
+    const lastIndex = values.findLastIndex(value => Number.isFinite(value));
+    if (lastIndex >= 0) {
+      const dot = node('span', 'chart-dot' + (index ? ' second' : ''));
+      dot.style.left = ((xs[lastIndex] ?? 400) / 4) + '%';
+      dot.style.top = chartY(values[lastIndex], max) + '%';
+      data.overlay.append(dot);
+    }
   });
+  const axis = data.svg.parentElement.nextElementSibling;
+  if (axis?.classList.contains('chart-axis')) {
+    const span = graphMinutes * 60;
+    axis.replaceChildren(node('span','',agoLabel(span)), node('span','',agoLabel(span / 2)), node('span','',t('axisNow')));
+  }
   if (activeChart===id && !chartTip.hidden) showChartSample(id,Number(data.hit.dataset.point ?? count-1),data.lastPointer);
 }
 function visibleSeries(key) {
@@ -3982,36 +4086,15 @@ function renderZoom() {
   const label = ['cpu','ram','swap'].includes(key) ? t(chartKeys[key]).replace('3', graphMinutes) : t(chartKeys[key]);
   setText('zoomTitle', label);
   $('zoomChart').setAttribute('aria-label', label);
-  plot('zoomChart', seriesForChart(key), ['net','io'].includes(key) ? 'auto' : 100, key);
+  const series = seriesForChart(key);
+  plot('zoomChart', series, ['net','io'].includes(key) ? 'auto' : 100, key, chartThreshold(key));
+  chartHeadline($('zoomStats'), series, key);
 }
 function renderCharts() {
   for (const [key,id] of Object.entries({cpu:'cpuChart',ram:'ramChart',swap:'swapChart',net:'netChart',io:'ioChart'})) {
     const series = seriesForChart(key);
-    plot(id, series, ['net','io'].includes(key) ? 'auto' : 100, key);
-    const formatter = ['net','io'].includes(key) ? speed : pct;
-    const stats = $(key + 'Stats');
-    const summarize = samples => {
-      const finite = samples.filter(Number.isFinite);
-      const latest = [...finite].at(-1);
-      const maximum = finite.length ? Math.max(...finite) : null;
-      return t('currentValue') + localeColon() + (latest == null ? '—' : formatter(latest))
-        + ' · ' + t('maxValue') + localeColon() + (maximum == null ? '—' : formatter(maximum));
-    };
-    if (stats) {
-      stats.replaceChildren();
-      const labels = key === 'net' ? ['rx','tx'] : key === 'io' ? ['read','write'] : [];
-      for (let i = 0; i < series.length; i++) {
-        const finite = series[i].filter(Number.isFinite);
-        const last = finite.length ? finite[finite.length-1] : null;
-        const peak = finite.length ? Math.max(...finite) : null;
-        const shortStats = (labels[i] ? (i===0 ? '↓ ' : '↑ ') : '')
-          + (last == null ? '—' : formatter(last)) + ' (' + t('maxShort') + ' '
-          + (peak == null ? '—' : formatter(peak)) + ')';
-        const div = node('span','',labels[i] ? shortStats : summarize(series[i]));
-        stats.append(div);
-        if (labels[i] && i===0) stats.append(document.createTextNode(' · '));
-      }
-    }
+    plot(id, series, ['net','io'].includes(key) ? 'auto' : 100, key, chartThreshold(key));
+    chartHeadline($(key + 'Stats'), series, key);
   }
   renderZoom();
 }
@@ -4209,11 +4292,11 @@ function renderSummary(data) {
   setText('updated', system.time ? new Date(system.time).toLocaleTimeString(lang) : '—');
 
   setText('cpuValue', state.rates.cpu == null ? t('estimating') : pct(state.rates.cpu));
-  updateBar('cpuBar', state.rates.cpu);
+  updateBar('cpuBar', state.rates.cpu, thresholds.cpu);
   setText('cpuExtra', system.load?.length ? `${t('load')}${localeColon()}${system.load.map(v => number(v)).join(' / ')}` : '—');
 
   setText('ramValue', pct(ramPct));
-  updateBar('ramBar', ramPct);
+  updateBar('ramBar', ramPct, thresholds.ram);
   setText('ramExtra', ram ? `${bytes(ram.used)} / ${bytes(ram.total)}` : '—');
 
   setText('swapValue', swap && swap.total === 0 ? '0 %' : pct(swapPct));
@@ -4225,7 +4308,7 @@ function renderSummary(data) {
     : swap ? `${bytes(swap.used)} / ${bytes(swap.total)}` : t('unknown'));
 
   setText('diskValue', pct(diskPct));
-  updateBar('diskBar', diskPct);
+  updateBar('diskBar', diskPct, thresholds.disk);
   setText('diskExtra', root ? `${root.mount} · ${bytes(root.used)} / ${bytes(root.total)}` : '—');
 
   setText('uptimeValue', duration(system.uptimeSeconds));
@@ -4735,6 +4818,7 @@ for (const name of ['cpu','ram','disk']) {
     input.value=String(thresholds[name]);
     saveSetting('esm32Warn'+name[0].toUpperCase()+name.slice(1),String(thresholds[name]));
     if (state.latest) renderHealth(state.latest);
+    renderCharts();
   });
 }
 $('showFooter').addEventListener('change', event => {
@@ -4806,9 +4890,10 @@ function showOffline(error) {
   $('errorBanner').classList.add('show');
 }
 async function poll() {
-  if (state.busy || !state.active) { if (state.busy) state.repoll = true; return; }
+  if (!state.active && (BACKGROUND_REFRESH_SECONDS <= 0 || Date.now() - (state.lastPoll || 0) < BACKGROUND_REFRESH_SECONDS * 1000 - 500)) return;
+  if (state.busy) { state.repoll = true; return; }
   state.busy = true;
-  try {
+  state.lastPoll = Date.now();  try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(8000, refreshSeconds * 2000));
     let response;
@@ -4901,7 +4986,7 @@ window.addEventListener('scroll',()=>{ if (!helpPinned) hideHelp(true); },true);
 document.addEventListener('visibilitychange', () => {
   state.active = !document.hidden;
   if (state.active) {
-    state.previous = null;
+    if (BACKGROUND_REFRESH_SECONDS <= 0) state.previous = null;
     poll();
   }
 });
