@@ -23,7 +23,7 @@ const ESM_TRUSTED_PROXIES = ['127.0.0.1', '::1'];
 
 // Set a password hash via the ESM_PASSWORD_HASH environment variable (recommended),
 // or paste a password_hash() result below. Never store a plaintext password here.
-const ESM_PASSWORD_HASH = '$2y$12$00x7Ygt9C2SEAIv1XlcByeltX2DEjU.TFasUsvU4BSsMdnhmmvlM2';
+const ESM_PASSWORD_HASH = '';
 // No hash means HTTP 401 for every request, including the JSON API.
 // Never bypass authentication based on REMOTE_ADDR: reverse proxies may use loopback.
 
