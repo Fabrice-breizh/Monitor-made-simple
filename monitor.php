@@ -1,19 +1,36 @@
 <?php
 /**
- * Monitor made Simple 1.3.0 — single-file Linux monitoring dashboard.
+ * Monitor made Simple 1.5.0 — single-file Linux monitoring dashboard.
  * PHP 8.1+, no external assets or database.
  * HTTP Basic authentication is mandatory for the page and JSON API.
+ *
+ * Endpoints (all behind the same authentication):
+ *   monitor.php                  the dashboard
+ *   monitor.php?api=stats        JSON used by the dashboard
+ *   monitor.php?api=health       JSON health summary; HTTP 503 when critical (&strict=1: also on warnings)
+ *   monitor.php?api=metrics      Prometheus text format
+ * Command line:
+ *   php monitor.php --hash       asks for a password and prints the hash to put in ESM_PASSWORD_HASH
+ *   php monitor.php --check      prints the health summary; exit code 0 = ok, 1 = warning, 2 = critical
+ *   php monitor.php --check --quiet   prints nothing when everything is fine (handy with cron's MAILTO)
  */
 declare(strict_types=1);
 
 // =============================================================
 // 01. CONFIGURATION
 // =============================================================
+const ESM_VERSION = '1.5.0';
 const ESM_TITLE = 'Monitor made Simple';
 const ESM_REFRESH_SECONDS = 5;
 // Refresh interval while the browser tab is in the background (0 = pause until the tab is shown again).
 const ESM_BACKGROUND_REFRESH_SECONDS = 30;
-const ESM_AUTH_USER = 'fabricebreizh';
+// The user name can also be set with the ESM_AUTH_USER environment variable.
+const ESM_AUTH_USER = 'admin';
+// After a successful login the browser gets a signed, HttpOnly cookie, so the (deliberately slow)
+// password hash is not recomputed for every refresh. 0 = check the password on every request.
+const ESM_SESSION_HOURS = 12;
+// Failed logins allowed per client address in 10 minutes before a 5-minute lockout (0 = no limit).
+const ESM_LOGIN_MAX_FAILURES = 8;
 // true = refuse plain HTTP (HTTPS, or a reverse proxy sending X-Forwarded-Proto: https, is required).
 const ESM_REQUIRE_HTTPS = false;
 // Behind a reverse proxy that terminates HTTPS: set to true so its X-Forwarded-Proto header is
@@ -52,6 +69,25 @@ const ESM_MONITOR_REMOTE_MOUNTS = false;
 // FUSE network calls may still block when a 60-second cache entry expires.
 const ESM_REMOTE_MOUNT_ALLOWLIST = [];
 
+// Server-side alert thresholds (the CPU, memory and disk thresholds of the page are set in its settings;
+// the values below are used by ?api=health, ?api=metrics and --check).
+const ESM_WARN_MEMORY_PERCENT = 85;
+const ESM_WARN_DISK_PERCENT = 85;
+const ESM_WARN_CPU_CELSIUS = 85;   // critical 10 °C above
+const ESM_WARN_DISK_CELSIUS = 60;  // critical 10 °C above
+const ESM_WARN_LOAD_PER_CORE = 2.0; // 5-minute load average divided by logical cores; critical at twice this
+// Ports listed here never raise the "database or API reachable from the network" warning.
+const ESM_PORT_ALERT_IGNORE = [];
+
+// Network page: recent web traffic, read from the access logs (shell patterns allowed).
+// The web server's user must be able to read them; the page shows the command when it cannot.
+const ESM_ACCESS_LOGS = ['/var/log/apache2/*access*.log', '/var/log/nginx/*access*.log'];
+const ESM_ACCESS_LOG_MINUTES = 15;
+// Apache's status page (mod_status), fetched from this machine only ('' = disabled).
+// Use https://127.0.0.1/server-status and your site's name as host if the plain HTTP site redirects.
+const ESM_APACHE_STATUS_URL = 'http://127.0.0.1/server-status';
+const ESM_APACHE_STATUS_HOST = 'localhost';
+
 // The local probe connects to a fixed loopback IP, never a user-supplied Host header.
 // Set ESM_SELF_CHECK_HOST to the certificate's DNS name for HTTPS virtual hosts.
 const ESM_SELF_CHECK = true;
@@ -78,8 +114,12 @@ function esmNonce(): string
     return $nonce;
 }
 
+const ESM_CLI = PHP_SAPI === 'cli';
+
+if (!ESM_CLI) {
 header('X-Content-Type-Options: nosniff');
-header('X-Monitor-Made-Simple: 1.3.0');
+// Marker for the local self-check. It carries no version: it is sent before authentication.
+header('X-Monitor-Made-Simple: 1');
 header('Referrer-Policy: no-referrer');
 header('X-Frame-Options: DENY');
 header('Cache-Control: private, no-store, max-age=0');
@@ -91,6 +131,7 @@ header(
     "img-src 'self' data:; connect-src 'self'; " .
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 );
+}
 
 function esmPasswordHash(): string
 {
@@ -98,25 +139,143 @@ function esmPasswordHash(): string
     return $env !== false && $env !== '' ? $env : ESM_PASSWORD_HASH;
 }
 
-function esmAuthorized(): bool
+function esmAuthUser(): string
 {
-    $hash = esmPasswordHash();
-    if ($hash !== '') {
-        $user = (string) ($_SERVER['PHP_AUTH_USER'] ?? '');
-        $password = (string) ($_SERVER['PHP_AUTH_PW'] ?? '');
-        if ($user === '') {
-            $header = (string) ($_SERVER['HTTP_AUTHORIZATION']
-                ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '');
-            if (strlen($header) <= 4096 && preg_match('/^Basic\s+([A-Za-z0-9+\/=]+)$/i', $header, $m)) {
-                $decoded = base64_decode($m[1], true);
-                if ($decoded !== false && str_contains($decoded, ':')) {
-                    [$user, $password] = explode(':', $decoded, 2);
-                }
+    $env = getenv('ESM_AUTH_USER');
+    return $env !== false && $env !== '' ? $env : ESM_AUTH_USER;
+}
+
+// [user, password] sent by the browser, or null when the request carries no credentials.
+function esmCredentials(): ?array
+{
+    $user = (string) ($_SERVER['PHP_AUTH_USER'] ?? '');
+    $password = (string) ($_SERVER['PHP_AUTH_PW'] ?? '');
+    if ($user === '') {
+        $header = (string) ($_SERVER['HTTP_AUTHORIZATION']
+            ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '');
+        if (strlen($header) <= 4096 && preg_match('/^Basic\s+([A-Za-z0-9+\/=]+)$/i', $header, $m)) {
+            $decoded = base64_decode($m[1], true);
+            if ($decoded !== false && str_contains($decoded, ':')) {
+                [$user, $password] = explode(':', $decoded, 2);
             }
         }
-        return hash_equals(ESM_AUTH_USER, $user) && password_verify($password, $hash);
     }
-    return false;
+    return $user === '' && $password === '' ? null : [$user, $password];
+}
+
+// Address used to count failed logins. X-Forwarded-For is only read behind a trusted proxy,
+// and only its last entry (the one that proxy added itself).
+function esmClientAddress(): string
+{
+    $remote = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    if (ESM_TRUST_PROXY_HTTPS && in_array($remote, ESM_TRUSTED_PROXIES, true)) {
+        $chain = explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''));
+        $last = trim((string) end($chain));
+        if (filter_var($last, FILTER_VALIDATE_IP)) return $last;
+    }
+    return $remote;
+}
+
+// Random key that signs session cookies. It lives in the private cache directory.
+function esmSessionSecret(): ?string
+{
+    $dir = esmCacheDirectory();
+    if ($dir === null) return null;
+    $file = $dir . '/session.key';
+    $secret = esmRead($file, 128);
+    if ($secret !== null && strlen($secret) === 64 && ctype_xdigit($secret)) return $secret;
+    $secret = bin2hex(random_bytes(32));
+    $temp = @tempnam($dir, '.tmp-');
+    if ($temp === false) return null;
+    @chmod($temp, 0600);
+    if (@file_put_contents($temp, $secret, LOCK_EX) === false || !@rename($temp, $file)) {
+        @unlink($temp);
+        return null;
+    }
+    return $secret;
+}
+function esmSessionCookieName(): string
+{
+    return 'mms_session_' . substr(hash('sha256', __FILE__), 0, 8);
+}
+// The signature covers the password hash: changing the password ends every session.
+function esmSessionSignature(int $expires, string $secret): string
+{
+    return hash_hmac('sha256', $expires . '|' . esmAuthUser() . '|' . esmPasswordHash(), $secret);
+}
+function esmSessionValid(): bool
+{
+    if (ESM_SESSION_HOURS <= 0) return false;
+    $cookie = (string) ($_COOKIE[esmSessionCookieName()] ?? '');
+    if (!preg_match('/\A(\d{10,11})\.([0-9a-f]{64})\z/', $cookie, $m)) return false;
+    $expires = (int) $m[1];
+    if ($expires < time() || $expires > time() + ESM_SESSION_HOURS * 3600 + 60) return false;
+    $secret = esmSessionSecret();
+    return $secret !== null && hash_equals(esmSessionSignature($expires, $secret), $m[2]);
+}
+function esmSessionStart(): void
+{
+    if (ESM_SESSION_HOURS <= 0 || headers_sent()) return;
+    $secret = esmSessionSecret();
+    if ($secret === null) return;
+    $expires = time() + ESM_SESSION_HOURS * 3600;
+    $path = (string) ($_SERVER['SCRIPT_NAME'] ?? '/');
+    if (!preg_match('#^/[a-zA-Z0-9/._~-]{0,255}$#', $path)) $path = '/';
+    setcookie(esmSessionCookieName(), $expires . '.' . esmSessionSignature($expires, $secret), [
+        'expires' => $expires, 'path' => $path, 'secure' => esmIsHttps(),
+        'httponly' => true, 'samesite' => 'Strict',
+    ]);
+}
+
+// Failed logins per client address: [count, start of the 10-minute window, locked until].
+function esmLoginFailureFile(): ?string
+{
+    $dir = esmCacheDirectory();
+    return $dir === null ? null : $dir . '/login-' . substr(hash('sha256', esmClientAddress()), 0, 24) . '.json';
+}
+function esmLoginLockedSeconds(): int
+{
+    if (ESM_LOGIN_MAX_FAILURES <= 0) return 0;
+    $file = esmLoginFailureFile();
+    $state = $file !== null ? json_decode((string) esmRead($file, 512), true) : null;
+    return is_array($state) ? max(0, (int) ($state['until'] ?? 0) - time()) : 0;
+}
+function esmLoginFailed(): void
+{
+    if (ESM_LOGIN_MAX_FAILURES <= 0) return;
+    $file = esmLoginFailureFile();
+    if ($file === null) return;
+    $state = json_decode((string) esmRead($file, 512), true);
+    if (!is_array($state) || time() - (int) ($state['since'] ?? 0) > 600) $state = ['count' => 0, 'since' => time(), 'until' => 0];
+    $state['count'] = (int) $state['count'] + 1;
+    if ($state['count'] >= ESM_LOGIN_MAX_FAILURES) $state = ['count' => 0, 'since' => time(), 'until' => time() + 300];
+    @file_put_contents($file, json_encode($state), LOCK_EX);
+    @chmod($file, 0600);
+    if (random_int(1, 50) === 1) { // occasional cleanup of old counters
+        foreach (glob(dirname($file) . '/login-*.json') ?: [] as $old) {
+            if (time() - (int) @filemtime($old) > 86400) @unlink($old);
+        }
+    }
+}
+
+// 'ok', 'denied' (no or wrong credentials) or 'locked' (too many failures from this address).
+function esmAuthenticate(): string
+{
+    $hash = esmPasswordHash();
+    if ($hash === '') return 'denied';
+    if (esmSessionValid()) return 'ok';
+    $credentials = esmCredentials();
+    if ($credentials === null) return 'denied';
+    if (esmLoginLockedSeconds() > 0) return 'locked';
+    // Both checks always run, so the response time does not reveal whether the user name exists.
+    $userOk = hash_equals(esmAuthUser(), $credentials[0]);
+    $passwordOk = password_verify($credentials[1], $hash);
+    if ($userOk && $passwordOk) {
+        esmSessionStart();
+        return 'ok';
+    }
+    esmLoginFailed();
+    return 'denied';
 }
 
 function esmIsHttps(): bool
@@ -127,23 +286,34 @@ function esmIsHttps(): bool
     if (!ESM_TRUST_PROXY_HTTPS || !in_array((string) ($_SERVER['REMOTE_ADDR'] ?? ''), ESM_TRUSTED_PROXIES, true)) return false;
     return strtolower(trim(explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''))[0])) === 'https';
 }
-if (ESM_REQUIRE_HTTPS && !esmIsHttps()) {
-    http_response_code(403);
-    header('Content-Type: text/plain; charset=utf-8');
-    echo "HTTPS is required for this dashboard.\n";
-    exit;
-}
-// Tells the browser to use HTTPS for the next visits (it cannot protect a very first plain HTTP visit).
-if (esmIsHttps()) header('Strict-Transport-Security: max-age=31536000');
-
-if (!esmAuthorized()) {
-    http_response_code(401);
-    if (esmPasswordHash() !== '') {
-        header('WWW-Authenticate: Basic realm="Monitor made Simple", charset="UTF-8"');
+// The functions of section 03 are needed by the authentication below; PHP declares top-level
+// functions of the file before running it, so they can be called from here.
+if (!ESM_CLI) {
+    if (ESM_REQUIRE_HTTPS && !esmIsHttps()) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "HTTPS is required for this dashboard.\n";
+        exit;
     }
-    header('Content-Type: text/plain; charset=utf-8');
-    echo "Monitor made Simple: access denied. Configure ESM_PASSWORD_HASH and use HTTPS.\n";
-    exit;
+    // Tells the browser to use HTTPS for the next visits (it cannot protect a very first plain HTTP visit).
+    if (esmIsHttps()) header('Strict-Transport-Security: max-age=31536000');
+
+    $esmAuth = esmAuthenticate();
+    if ($esmAuth !== 'ok') {
+        header('Content-Type: text/plain; charset=utf-8');
+        if ($esmAuth === 'locked') {
+            http_response_code(429);
+            header('Retry-After: ' . max(1, esmLoginLockedSeconds()));
+            echo "Monitor made Simple: too many failed logins. Try again in a few minutes.\n";
+            exit;
+        }
+        http_response_code(401);
+        if (esmPasswordHash() !== '') {
+            header('WWW-Authenticate: Basic realm="Monitor made Simple", charset="UTF-8"');
+        }
+        echo "Monitor made Simple: access denied. Configure ESM_PASSWORD_HASH and use HTTPS.\n";
+        exit;
+    }
 }
 
 // =============================================================
@@ -165,14 +335,19 @@ function esmRead(string $path, int $maxBytes = 1048576): ?string
 
 function esmCacheDirectory(): ?string
 {
+    static $checked = false, $directory = null;
+    if ($checked) return $directory;
+    $checked = true;
+    // One directory per system user: the web server and a cron job never share (or fight over) files.
+    $owner = function_exists('posix_geteuid') ? '-' . posix_geteuid() : '';
     $base = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR
-        . 'monitor-made-simple-' . substr(hash('sha256', __FILE__), 0, 20);
+        . 'monitor-made-simple-' . substr(hash('sha256', __FILE__), 0, 20) . $owner;
     if (!is_dir($base)) @mkdir($base, 0700);
-    if (!is_dir($base) || !is_writable($base)) return null;
+    if (is_link($base) || !is_dir($base) || !is_writable($base)) return null;
     $perms = @fileperms($base);
     if ($perms === false || ($perms & 0077) !== 0) return null;
     if (function_exists('posix_geteuid') && @fileowner($base) !== posix_geteuid()) return null;
-    return $base;
+    return $directory = $base;
 }
 function esmCacheRead(string $key): ?array
 {
@@ -195,12 +370,35 @@ function esmCacheWrite(string $key, array $value): void
     $written = @file_put_contents($temp, $json, LOCK_EX);
     if ($written === false || !@rename($temp, $dir . '/' . $key . '.json')) @unlink($temp);
 }
-function esmCachedCollect(string $key, int $seconds, callable $collector): array
+// With PHP-FPM, slow collections are refreshed after the response has been sent:
+// the page gets the previous result immediately and the next refresh shows the new one.
+function esmCanDefer(): bool
+{
+    return !ESM_CLI && function_exists('fastcgi_finish_request');
+}
+function esmRunDeferred(): void
+{
+    $tasks = $GLOBALS['esmDeferredTasks'] ?? [];
+    $GLOBALS['esmDeferredTasks'] = [];
+    if (!$tasks) return;
+    @fastcgi_finish_request();
+    @ignore_user_abort(true);
+    foreach ($tasks as $task) {
+        try { $task(); } catch (Throwable $error) { error_log('Monitor made Simple: deferred refresh failed (' . get_class($error) . ')'); }
+    }
+}
+function esmCachedCollect(string $key, int $seconds, callable $collector, bool $mayDefer = true): array
 {
     $fresh = static fn(?array $entry): bool => $entry !== null && isset($entry['at'], $entry['data'])
         && is_array($entry['data']) && (time() - (int) $entry['at']) >= 0 && (time() - (int) $entry['at']) < $seconds;
     $previous = esmCacheRead($key);
     if ($fresh($previous)) return $previous['data'];
+    // A recent result exists: serve it now and refresh it once the response is sent.
+    if ($mayDefer && esmCanDefer() && $previous !== null && is_array($previous['data'] ?? null)
+        && abs(time() - (int) ($previous['at'] ?? 0)) < max(120, 5 * $seconds)) {
+        $GLOBALS['esmDeferredTasks'][$key] = static fn(): array => esmCachedCollect($key, $seconds, $collector, false);
+        return $previous['data'];
+    }
     // Only one request collects at a time. The others reuse the previous result instead of
     // collecting again (this also keeps CPU percentages, which compare two samples, consistent).
     $dir = esmCacheDirectory();
@@ -296,30 +494,45 @@ function mbSafeLimit(string $value, int $max): string
     return $value;
 }
 
+// Facts that only change with a reboot or an upgrade: read once every five minutes.
+function esmSystemStatic(): array
+{
+    return esmCachedCollect('system-static', 300, static function (): array {
+        $os = 'Linux';
+        $release = esmRead('/etc/os-release', 16384);
+        if ($release !== null && preg_match('/^PRETTY_NAME=(.+)$/m', $release, $m)) {
+            $os = trim(trim($m[1]), "\"'");
+        }
+        $cpuInfo = esmRead('/proc/cpuinfo', 4194304);
+        $cores = $cpuInfo !== null ? preg_match_all('/^processor\s*:/mi', $cpuInfo) : false;
+        $topology = esmCpuTopology($cpuInfo);
+        return [
+            'os' => mbSafeLimit($os, 160),
+            'cpuModel' => esmCpuModel($cpuInfo),
+            'logicalCores' => $cores !== false && $cores > 0 ? $cores : null,
+            'cpuSockets' => $topology['sockets'],
+            'physicalCores' => $topology['cores'],
+        ];
+    }, false);
+}
 function esmSystem(): array
 {
-    $os = 'Linux';
-    $release = esmRead('/etc/os-release', 16384);
-    if ($release !== null && preg_match('/^PRETTY_NAME=(.+)$/m', $release, $m)) {
-        $os = trim(trim($m[1]), "\"'");
-    }
+    $static = esmSystemStatic();
     $uptimeText = esmRead('/proc/uptime', 64);
     $uptime = $uptimeText !== null && preg_match('/^([\d.]+)/', $uptimeText, $m)
         ? (int) (float) $m[1] : null;
-    $cpuInfo = esmRead('/proc/cpuinfo', 1048576);
-    $cores = $cpuInfo !== null ? preg_match_all('/^processor\s*:/mi', $cpuInfo) : false;
     $load = function_exists('sys_getloadavg') ? @sys_getloadavg() : false;
     return [
         'hostname' => function_exists('gethostname') ? (gethostname() ?: null) : null,
-        'os' => $os,
+        'os' => $static['os'] ?? 'Linux',
         'kernel' => function_exists('php_uname') ? php_uname('r') : null,
         'architecture' => function_exists('php_uname') ? php_uname('m') : null,
         'php' => PHP_VERSION,
         'uptimeSeconds' => $uptime,
-        'cpuModel' => esmCpuModel($cpuInfo),
-        'logicalCores' => $cores !== false && $cores > 0 ? $cores : null,
-        'cpuSockets' => esmCpuTopology($cpuInfo)['sockets'],
-        'physicalCores' => esmCpuTopology($cpuInfo)['cores'],
+        'cpuModel' => $static['cpuModel'] ?? null,
+        'logicalCores' => $static['logicalCores'] ?? null,
+        'cpuSockets' => $static['cpuSockets'] ?? null,
+        'physicalCores' => $static['physicalCores'] ?? null,
         'load' => is_array($load) ? array_map('floatval', $load) : null,
         'time' => date(DATE_ATOM),
     ];
@@ -513,7 +726,9 @@ function esmRunCommand(array $command, float $timeout, int $maxBytes): ?string
 {
     if (!function_exists('proc_open')) return null;
     $spec = [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']];
-    $proc = @proc_open($command, $spec, $pipes);
+    // Fixed environment: the output is parsed, so it must not depend on the server's language.
+    $environment = ['LC_ALL' => 'C', 'PATH' => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'];
+    $proc = @proc_open($command, $spec, $pipes, null, $environment);
     if (!is_resource($proc)) return null;
     stream_set_blocking($pipes[1], false);
     $text = '';
@@ -603,7 +818,7 @@ function esmDiskIo(): array
 }
 
 // =============================================================
-// 09. NETWORK INTERFACES
+// 09b. NETWORK INTERFACES
 // =============================================================
 function esmNetworkCategory(string $name): string
 {
@@ -1035,6 +1250,351 @@ function esmParseListeningPorts(?string ...$tables): array
 }
 
 // =============================================================
+// 11d. NETWORK ACTIVITY: CONNECTIONS, SESSIONS, WEB TRAFFIC, APACHE STATUS
+// =============================================================
+function esmIsLoopbackIp(string $ip): bool
+{
+    return $ip === '::1' || $ip === '::' || $ip === '0.0.0.0' || str_starts_with($ip, '127.');
+}
+// Established TCP connections, read from the kernel's tables (nothing is scanned).
+// A connection is "incoming" when its local port is one this server listens on. $tables: tests only.
+function esmConnections(?string ...$tables): array
+{
+    if (!$tables) $tables = [esmRead('/proc/net/tcp', 8388608), esmRead('/proc/net/tcp6', 8388608)];
+    $listening = [];
+    $rows = [];
+    foreach ($tables as $text) {
+        foreach (explode("\n", (string) $text) as $line) {
+            $f = preg_split('/\s+/', trim($line));
+            if (!$f || count($f) < 4 || !str_contains($f[1], ':') || !str_contains($f[2], ':')) continue;
+            $localPortHex = explode(':', $f[1], 2)[1];
+            if (!ctype_xdigit($localPortHex)) continue;
+            $localPort = (int) hexdec($localPortHex);
+            if ($f[3] === '0A') { $listening[$localPort] = true; continue; } // 0A = LISTEN
+            if ($f[3] !== '01') continue; // 01 = ESTABLISHED
+            [$remoteHex, $remotePortHex] = explode(':', $f[2], 2);
+            $ip = esmProcNetIp($remoteHex);
+            if ($ip === null || !ctype_xdigit($remotePortHex)) continue;
+            if (str_starts_with($ip, '::ffff:')) $ip = substr($ip, 7);
+            $rows[] = [$localPort, $ip, (int) hexdec($remotePortHex)];
+        }
+    }
+    $incoming = [];
+    $outgoing = [];
+    $local = 0;
+    foreach ($rows as [$localPort, $ip, $remotePort]) {
+        if (esmIsLoopbackIp($ip)) { $local++; continue; }
+        if (isset($listening[$localPort])) $incoming[$localPort][$ip] = ($incoming[$localPort][$ip] ?? 0) + 1;
+        else $outgoing[$ip . ' ' . $remotePort] = ($outgoing[$ip . ' ' . $remotePort] ?? 0) + 1;
+    }
+    ksort($incoming);
+    $services = [];
+    $addresses = [];
+    $incomingTotal = 0;
+    foreach ($incoming as $port => $clients) {
+        arsort($clients);
+        $incomingTotal += array_sum($clients);
+        $addresses += $clients;
+        $list = [];
+        foreach (array_slice($clients, 0, 8, true) as $ip => $count) {
+            $list[] = ['ip' => (string) $ip, 'count' => $count, 'public' => esmIsPublicIp((string) $ip)];
+        }
+        $services[] = ['port' => $port, 'service' => esmPortName((int) $port), 'connections' => array_sum($clients),
+            'addresses' => count($clients), 'clients' => $list];
+    }
+    arsort($outgoing);
+    $destinations = [];
+    foreach (array_slice($outgoing, 0, 15, true) as $key => $count) {
+        [$ip, $port] = explode(' ', (string) $key);
+        $destinations[] = ['ip' => $ip, 'port' => (int) $port, 'service' => esmPortName((int) $port), 'count' => $count, 'public' => esmIsPublicIp($ip)];
+    }
+    return [
+        'incoming' => $incomingTotal, 'incomingAddresses' => count($addresses),
+        'outgoing' => array_sum($outgoing), 'outgoingDestinations' => count($outgoing), 'local' => $local,
+        'services' => array_slice($services, 0, 30), 'destinations' => $destinations,
+    ];
+}
+// Who is logged in (SSH, console), as reported by "who". $text: tests only.
+function esmSessions(?string $text = null): array
+{
+    if ($text === null) {
+        $binary = null;
+        foreach (['/usr/bin/who', '/bin/who'] as $candidate) {
+            if (@is_executable($candidate)) { $binary = $candidate; break; }
+        }
+        if ($binary === null) return ['available' => false, 'sessions' => []];
+        $text = esmRunCommand([$binary], 0.9, 32768);
+        if ($text === null) return ['available' => false, 'sessions' => []];
+    }
+    $sessions = [];
+    foreach (explode("\n", $text) as $line) {
+        if (!preg_match('/^(\S+)\s+(\S+)\s+(.*?)\s*(?:\(([^)]*)\))?\s*$/', $line, $m) || $m[3] === '') continue;
+        $since = strtotime($m[3]);
+        if ($since !== false && $since > time() + 86400) $since = strtotime('-1 year', $since); // date without a year
+        $sessions[] = ['user' => mbSafeLimit($m[1], 40), 'line' => mbSafeLimit($m[2], 20),
+            'from' => mbSafeLimit($m[4] ?? '', 80), 'since' => $since === false ? null : $since];
+    }
+    return ['available' => true, 'sessions' => array_slice($sessions, 0, 20)];
+}
+
+// The end of a log file: [text made of whole lines, true when the beginning of the file was skipped].
+function esmLogTail(string $file, int $maxBytes): ?array
+{
+    $handle = @fopen($file, 'rb');
+    if ($handle === false) return null;
+    $size = (int) (@fstat($handle)['size'] ?? 0);
+    $skipped = $size > $maxBytes;
+    if ($skipped) @fseek($handle, $size - $maxBytes);
+    $text = (string) @stream_get_contents($handle, $maxBytes);
+    fclose($handle);
+    if ($skipped) {
+        $cut = strpos($text, "\n");
+        $text = $cut === false ? '' : substr($text, $cut + 1);
+    }
+    return [$text, $skipped];
+}
+function esmLogTime(string $text): ?int
+{
+    static $cache = [];
+    if (array_key_exists($text, $cache)) return $cache[$text];
+    if (count($cache) > 5000) $cache = [];
+    $date = DateTime::createFromFormat('d/M/Y:H:i:s O', $text);
+    return $cache[$text] = $date === false ? null : $date->getTimestamp();
+}
+// One line of an access log in the "combined" format (Apache, nginx) or Apache's "vhost_combined".
+function esmParseAccessLine(string $line): ?array
+{
+    static $pattern = '/^(\S+) (?:(\S+) )?\S+ \S+ \[([^\]]+)\] "((?:[^"\\\\]|\\\\.)*)" (\d{3}) (\d+|-)(?: "(?:[^"\\\\]|\\\\.)*" "((?:[^"\\\\]|\\\\.)*)")?/';
+    if (!preg_match($pattern, $line, $m)) return null;
+    $time = esmLogTime($m[3]);
+    if ($time === null) return null;
+    $vhost = '';
+    $ip = $m[1];
+    if ($m[2] !== '') { // vhost_combined: "site:port address ..."
+        $vhost = (string) preg_replace('/:\d+$/', '', $m[1]);
+        $ip = $m[2];
+    }
+    if (!preg_match('/^[\w.:-]{2,60}$/', $ip)) return null;
+    $request = explode(' ', $m[4], 3);
+    $method = preg_match('/^[A-Z]{3,10}$/', $request[0]) ? $request[0] : '';
+    $path = $method !== '' && isset($request[1]) ? explode('?', $request[1], 2)[0] : ''; // query strings may hold secrets
+    return ['time' => $time, 'ip' => $ip, 'vhost' => mbSafeLimit($vhost, 80), 'method' => $method,
+        'path' => mbSafeLimit($path, 120), 'status' => (int) $m[5], 'bytes' => $m[6] === '-' ? 0 : (float) $m[6],
+        'agent' => $m[7] ?? ''];
+}
+function esmIsBotAgent(string $agent): bool
+{
+    return $agent === '' || $agent === '-'
+        || (bool) preg_match('/bot\b|bot[\/;) ]|crawl|spider|slurp|scan|curl\/|wget|python|go-http-client|libwww|zgrab|masscan|nmap|nikto|censys|headless|uptime|monitor|facebookexternalhit|feedfetcher|preview/i', $agent);
+}
+// Requests of the last minutes, from the access logs. Nothing is stored: the logs are read again each time.
+// $ownPath: requests for this dashboard are left out, or it would top its own statistics.
+function esmWebTraffic(string $ownPath = ''): array
+{
+    $minutes = max(1, min(60, ESM_ACCESS_LOG_MINUTES));
+    $files = [];
+    $blocked = [];
+    foreach (ESM_ACCESS_LOGS as $pattern) {
+        $readable = 0;
+        $unreadable = 0;
+        foreach (@glob($pattern, GLOB_NOSORT) ?: [] as $file) {
+            if (preg_match('/\.(?:gz|bz2|xz|zst|\d+)$/', $file) || !@is_file($file)) continue; // rotated files
+            if (@is_readable($file)) { $files[$file] = (int) @filemtime($file); $readable++; } else $unreadable++;
+        }
+        $directory = dirname($pattern);
+        if ($readable === 0 && !preg_match('/[*?\[]/', $directory) && @is_dir($directory)
+            && ($unreadable > 0 || !@is_readable($directory))) {
+            $blocked[] = ['directory' => $directory, 'pattern' => $pattern];
+        }
+    }
+    if (!$files) {
+        if (!$blocked) return ['state' => 'missing', 'minutes' => $minutes];
+        $account = function_exists('posix_getpwuid') ? (posix_getpwuid(posix_geteuid())['name'] ?? '') : '';
+        if (!preg_match('/^[a-z_][a-z0-9_-]{0,31}$/i', $account)) $account = 'www-data';
+        $commands = [];
+        foreach ($blocked as $entry) {
+            if (!preg_match('#^[\w/.*?-]+$#', $entry['pattern'])) continue;
+            // Read access to the access logs only, kept when the logs are rotated (default ACL of the folder).
+            // The pattern is expanded by a root shell: an administrator who cannot list the folder would get "no such file".
+            $commands[] = "sudo setfacl -m u:$account:rx,d:u:$account:r {$entry['directory']} && sudo sh -c 'setfacl -m u:$account:r {$entry['pattern']}'";
+        }
+        $undo = [];
+        foreach ($blocked as $entry) {
+            if (preg_match('#^[\w/.-]+$#', $entry['directory'])) $undo[] = "sudo setfacl -b {$entry['directory']} && sudo sh -c 'setfacl -b {$entry['pattern']}'";
+        }
+        return ['state' => 'unreadable', 'minutes' => $minutes, 'user' => $account,
+            'command' => implode("\n", $commands), 'undo' => $commands ? implode("\n", $undo) : ''];
+    }
+    arsort($files);
+    $now = time();
+    $start = $now - 60 * $minutes;
+    $series = array_fill(0, $minutes, 0);
+    $status = ['2' => 0, '3' => 0, '4' => 0, '5' => 0];
+    $clients = [];
+    $pages = [];
+    $errors = [];
+    $requests = 0;
+    $bytes = 0.0;
+    $coveredFrom = $start;
+    foreach (array_slice(array_keys($files), 0, 6) as $file) {
+        $tail = esmLogTail($file, 1048576);
+        if ($tail === null) continue;
+        $lines = explode("\n", $tail[0]);
+        $reachedStart = !$tail[1];
+        $oldest = null;
+        for ($i = count($lines) - 1; $i >= 0; $i--) {
+            if ($lines[$i] === '') continue;
+            $entry = esmParseAccessLine($lines[$i]);
+            if ($entry === null) continue;
+            if ($entry['time'] < $start) { $reachedStart = true; break; }
+            if ($entry['time'] > $now + 5) continue;
+            $oldest = $entry['time'];
+            if (esmIsLoopbackIp($entry['ip']) || ($ownPath !== '' && $entry['path'] === $ownPath)) continue;
+            $requests++;
+            $bytes += $entry['bytes'];
+            $series[min($minutes - 1, max(0, intdiv($entry['time'] - $start, 60)))]++;
+            $class = (string) intdiv($entry['status'], 100);
+            if (isset($status[$class])) $status[$class]++;
+            $bot = esmIsBotAgent($entry['agent']);
+            $page = $entry['vhost'] . ($entry['path'] !== '' ? $entry['path'] : ($entry['vhost'] !== '' ? ' ' : '') . '—');
+            $client = &$clients[$entry['ip']];
+            $client ??= ['requests' => 0, 'human' => 0, 'last' => 0, 'page' => '', 'errors' => 0];
+            $client['requests']++;
+            if (!$bot) $client['human']++;
+            if ($entry['status'] >= 400) $client['errors']++;
+            if ($entry['time'] >= $client['last']) { $client['last'] = $entry['time']; $client['page'] = $page; }
+            unset($client);
+            if (count($pages) < 4000 || isset($pages[$page])) $pages[$page] = ($pages[$page] ?? 0) + 1;
+            if ($entry['status'] >= 400) {
+                $key = $entry['status'] . ' ' . $page;
+                if (count($errors) < 4000 || isset($errors[$key])) $errors[$key] = ($errors[$key] ?? 0) + 1;
+            }
+        }
+        // A very busy log: the part that was read does not go back to the start of the period.
+        if (!$reachedStart && $oldest !== null) $coveredFrom = max($coveredFrom, $oldest);
+    }
+    $bots = count(array_filter($clients, static fn(array $client): bool => $client['human'] === 0));
+    uasort($clients, static fn(array $a, array $b): int => $b['requests'] <=> $a['requests']);
+    $top = [];
+    foreach (array_slice($clients, 0, 8, true) as $ip => $client) {
+        $top[] = ['ip' => (string) $ip, 'requests' => $client['requests'], 'errors' => $client['errors'],
+            'bot' => $client['human'] === 0, 'last' => $client['last'], 'page' => $client['page']];
+    }
+    arsort($pages);
+    arsort($errors);
+    $list = static function (array $counts, int $limit, bool $withStatus): array {
+        $out = [];
+        foreach (array_slice($counts, 0, $limit, true) as $key => $count) {
+            $key = (string) $key;
+            $out[] = $withStatus ? ['status' => (int) substr($key, 0, 3), 'page' => substr($key, 4), 'count' => $count]
+                : ['page' => $key, 'count' => $count];
+        }
+        return $out;
+    };
+    return [
+        'state' => 'ok', 'minutes' => $minutes, 'coveredSeconds' => $now - $coveredFrom,
+        'requests' => $requests, 'lastMinute' => $series[$minutes - 1], 'bytes' => $bytes, 'series' => $series, 'status' => $status,
+        'visitors' => count($clients), 'bots' => $bots,
+        'clients' => $top, 'pages' => $list($pages, 8, false), 'errors' => $list($errors, 6, true),
+    ];
+}
+
+// Small HTTP GET to this machine only (used for Apache's status page): [status, body] or null.
+function esmLoopbackFetch(string $url, string $hostHeader, float $timeout, int $maxBytes): ?array
+{
+    $parts = parse_url($url);
+    $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+    $host = trim((string) ($parts['host'] ?? ''), '[]');
+    if (!in_array($scheme, ['http', 'https'], true)) return null;
+    if ($host === 'localhost') $host = '127.0.0.1';
+    if ($host !== '::1' && !preg_match('/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/', $host)) return null; // loopback only
+    $port = (int) ($parts['port'] ?? ($scheme === 'https' ? 443 : 80));
+    $target = (string) ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+    if (!preg_match('#^/[\w/.?=&~%-]*$#', $target) || !preg_match('/^[\w.-]{1,120}$/', $hostHeader)) return null;
+    // The certificate is not checked: the connection never leaves this machine.
+    $context = stream_context_create(['ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'peer_name' => $hostHeader, 'SNI_enabled' => true]]);
+    $endpoint = ($scheme === 'https' ? 'tls://' : 'tcp://') . (str_contains($host, ':') ? "[$host]" : $host) . ':' . $port;
+    $client = @stream_socket_client($endpoint, $errno, $errorText, $timeout, STREAM_CLIENT_CONNECT, $context);
+    if (!is_resource($client)) return null;
+    stream_set_timeout($client, (int) $timeout, (int) (($timeout - (int) $timeout) * 1000000));
+    @fwrite($client, "GET $target HTTP/1.0\r\nHost: $hostHeader\r\nUser-Agent: Monitor-made-Simple/" . ESM_VERSION . "\r\nConnection: close\r\n\r\n");
+    $response = '';
+    $deadline = microtime(true) + 2 * $timeout;
+    while (!feof($client) && strlen($response) < $maxBytes && microtime(true) < $deadline) {
+        $chunk = @fread($client, 65536);
+        if ($chunk === false || ($chunk === '' && (stream_get_meta_data($client)['timed_out'] ?? false))) break;
+        $response .= $chunk;
+    }
+    fclose($client);
+    if (!preg_match('#^HTTP/\d(?:\.\d)? (\d{3})#', $response, $m)) return null;
+    $split = strpos($response, "\r\n\r\n");
+    return [(int) $m[1], $split === false ? '' : substr($response, $split + 4)];
+}
+// Requests being served right now: the table of Apache's status page (mod_status). $html: tests only.
+function esmParseApacheWorkers(string $html, string $ownPath = ''): array
+{
+    $columns = null;
+    $out = [];
+    if (!preg_match_all('#<tr[^>]*>(.*?)</tr>#s', $html, $rows)) return [];
+    foreach ($rows[1] as $rowHtml) {
+        if (!preg_match_all('#<t[dh][^>]*>(.*?)</t[dh]>#s', $rowHtml, $cells)) continue;
+        $cells = array_map(static fn(string $cell): string => trim(html_entity_decode(strip_tags($cell), ENT_QUOTES | ENT_HTML5, 'UTF-8')), $cells[1]);
+        if (in_array('Srv', $cells, true) && in_array('Request', $cells, true)) { $columns = array_flip($cells); continue; }
+        if ($columns === null || count($cells) < count($columns)) continue;
+        $cell = static fn(string $name): string => isset($columns[$name]) ? (string) ($cells[$columns[$name]] ?? '') : '';
+        $mode = $cell('M');
+        if (!in_array($mode, ['W', 'R', 'C', 'L', 'G'], true)) continue; // serving, reading, closing, logging, finishing
+        $request = explode(' ', $cell('Request'), 3);
+        $path = explode('?', (string) ($request[1] ?? ''), 2)[0];
+        if ($path === '' && $mode !== 'R') continue;
+        if ($path === '/server-status' || ($ownPath !== '' && $path === $ownPath) || esmIsLoopbackIp($cell('Client'))) continue;
+        $out[] = ['client' => mbSafeLimit($cell('Client'), 60), 'vhost' => mbSafeLimit((string) preg_replace('/:\d+$/', '', $cell('VHost')), 80),
+            'method' => mbSafeLimit((string) $request[0], 10), 'path' => mbSafeLimit($path, 120), 'mode' => $mode,
+            'seconds' => is_numeric($cell('SS')) ? (int) $cell('SS') : null];
+    }
+    usort($out, static fn(array $a, array $b): int => ($b['seconds'] ?? 0) <=> ($a['seconds'] ?? 0));
+    return array_slice($out, 0, 25);
+}
+function esmApacheStatus(string $ownPath = ''): array
+{
+    if (ESM_APACHE_STATUS_URL === '') return ['state' => 'disabled'];
+    $auto = esmLoopbackFetch(ESM_APACHE_STATUS_URL . '?auto', ESM_APACHE_STATUS_HOST, 0.8, 262144);
+    if ($auto === null) return ['state' => 'unreachable', 'httpStatus' => null];
+    if ($auto[0] !== 200 || !str_contains($auto[1], 'Scoreboard:')) return ['state' => 'unreachable', 'httpStatus' => $auto[0]];
+    $values = [];
+    foreach (explode("\n", $auto[1]) as $line) {
+        if (str_contains($line, ': ')) { [$name, $value] = explode(': ', $line, 2); $values[trim($name)] = trim($value); }
+    }
+    $number = static fn(string $name): ?float => is_numeric($values[$name] ?? null) ? (float) $values[$name] : null;
+    $board = count_chars((string) ($values['Scoreboard'] ?? ''), 1);
+    $extended = isset($values['Total Accesses']);
+    $workers = [];
+    if ($extended) {
+        $page = esmLoopbackFetch(ESM_APACHE_STATUS_URL, ESM_APACHE_STATUS_HOST, 0.8, 2097152);
+        if ($page !== null && $page[0] === 200) $workers = esmParseApacheWorkers($page[1], $ownPath);
+    }
+    return [
+        'state' => 'ok', 'extended' => $extended, 'atMs' => round(microtime(true) * 1000),
+        'version' => mbSafeLimit((string) ($values['ServerVersion'] ?? ''), 80),
+        'busy' => $number('BusyWorkers'), 'idle' => $number('IdleWorkers'),
+        'keepalive' => $number('ConnsAsyncKeepAlive') ?? (float) ($board[ord('K')] ?? 0),
+        'connections' => $number('ConnsTotal'),
+        'totalAccesses' => $number('Total Accesses'), 'totalKBytes' => $number('Total kBytes'),
+        'uptimeSeconds' => $number('Uptime'), 'requests' => $workers,
+    ];
+}
+function esmNetworkActivity(): array
+{
+    $ownPath = (string) ($_SERVER['SCRIPT_NAME'] ?? '');
+    return [
+        'connections' => esmCachedCollect('connections', 4, static fn(): array => esmConnections(), false),
+        'sessions' => esmCachedCollect('sessions', 10, static fn(): array => esmSessions()),
+        'web' => esmCachedCollect('web-traffic', 10, static fn(): array => esmWebTraffic($ownPath)),
+        'apache' => esmCachedCollect('apache-status', 3, static fn(): array => esmApacheStatus($ownPath), false),
+    ];
+}
+
+// =============================================================
 // 12. LOCAL TCP SERVICE CHECKS
 // =============================================================
 function esmServices(): array
@@ -1098,6 +1658,7 @@ function esmSampleProcesses(): array
     if (!is_array($names)) return [];
     $pids = array_values(array_filter($names, static fn($v): bool => ctype_digit($v) && (int) $v > 0));
     usort($pids, static fn($a, $b): int => (int) $a <=> (int) $b);
+    $alive = array_flip($pids);
     $partial = count($pids) > ESM_MAX_PROCESSES;
     if ($partial) {
         $offset = ((int) floor($now / ESM_PROCESS_CACHE_SECONDS) * ESM_MAX_PROCESSES) % count($pids);
@@ -1124,7 +1685,6 @@ function esmSampleProcesses(): array
         $id = $pid . ':' . $parts[19];
         $ticks = (float) $parts[11] + (float) $parts[12];
         $rssPages = max(0, (float) $parts[21]);
-        $snapshot[$id] = $ticks;
         $records[] = [
             'pid' => $pid, 'name' => mbSafeLimit($name, 64), 'start' => $parts[19],
             'ticks' => $ticks, 'rssPages' => $rssPages, 'id' => $id,
@@ -1132,15 +1692,28 @@ function esmSampleProcesses(): array
     }
     $cpu = esmCpu();
     $total = (float) ($cpu['total'] ?? 0);
-    $deltaTotal = $total - $oldTotal;
     $coreCount = max(1, count($cpu['cores'] ?? []));
+    // Each process is compared with its own previous measurement (its CPU time and the total CPU
+    // time at that moment). When there are more processes than ESM_MAX_PROCESSES, only a part is
+    // read each time: a process read a few rounds ago still has a valid comparison point.
     foreach ($records as &$record) {
-        $oldTicks = $before[$record['id']] ?? null;
+        $old = $before[$record['id']] ?? null;
+        $oldTicks = is_array($old) ? ($old[0] ?? null) : $old;
+        $baseTotal = is_array($old) ? (float) ($old[1] ?? 0) : $oldTotal;
         $delta = $oldTicks === null ? null : $record['ticks'] - (float) $oldTicks;
-        $record['cpuPercent'] = $delta !== null && $delta >= 0 && $deltaTotal > 0
-            ? round(min(100 * $coreCount, 100 * $coreCount * $delta / $deltaTotal), 1) : null;
+        $span = $total - $baseTotal;
+        $record['cpuPercent'] = $delta !== null && $delta >= 0 && $span > 0
+            ? round(min(100 * $coreCount, 100 * $coreCount * $delta / $span), 1) : null;
+        $snapshot[$record['id']] = [$record['ticks'], $total];
     }
     unset($record);
+    if ($partial) {
+        foreach ($before as $id => $old) {
+            if (count($snapshot) >= 4 * ESM_MAX_PROCESSES) break;
+            if (isset($snapshot[$id]) || !is_array($old) || !isset($alive[explode(':', (string) $id)[0]])) continue;
+            $snapshot[$id] = $old;
+        }
+    }
     $cpuSorted = $records;
     usort($cpuSorted, static fn($a, $b): int => ($b['cpuPercent'] ?? -1) <=> ($a['cpuPercent'] ?? -1));
     $ramSorted = $records;
@@ -1206,10 +1779,12 @@ function esmSelfCheckHostname(): string
         && !str_contains($name, '..')) return $name;
     return 'localhost';
 }
-function esmHttpChecks(): array
+// $allowProbe: null = probe now unless the refresh can be done after the response (PHP-FPM).
+function esmHttpChecks(?bool $allowProbe = null): array
 {
+    $allowProbe ??= !esmCanDefer();
     $checks = [];
-    if (ESM_SELF_CHECK) {
+    if (ESM_SELF_CHECK && !ESM_CLI) {
         $script = (string) ($_SERVER['SCRIPT_NAME'] ?? '/monitor.php');
         if (!preg_match('#^/[a-zA-Z0-9/._~-]{1,255}\.php$#', $script)) $script = '/monitor.php';
         $serverPort = (int) ($_SERVER['SERVER_PORT'] ?? 80);
@@ -1231,26 +1806,34 @@ function esmHttpChecks(): array
     $saved = is_array($previous['checks'] ?? null) ? $previous['checks'] : [];
     $results = [];
     $probed = 0;
+    $changed = false;
+    $due = false;
+    $keys = [];
     foreach ($checks as $check) {
         $key = hash('sha256', json_encode($check) ?: '');
+        $keys[$key] = true;
         $cached = $saved[$key] ?? null;
-        $fresh = is_array($cached) && isset($cached['checkedAt'])
-            && time() - (int) $cached['checkedAt'] >= 0
-            && time() - (int) $cached['checkedAt'] < (!empty($cached['online']) ? ESM_HTTP_CACHE_SECONDS : ESM_HTTP_RETRY_SECONDS);
+        $lifetime = !empty($cached['online']) ? ESM_HTTP_CACHE_SECONDS : ESM_HTTP_RETRY_SECONDS;
+        $age = is_array($cached) && isset($cached['checkedAt']) ? time() - (int) $cached['checkedAt'] : null;
+        $fresh = $age !== null && $age >= 0 && $age < $lifetime;
         if ($fresh) {
             $results[] = $cached;
-        } elseif ($probed < ESM_HTTP_PROBES_PER_REQUEST) {
+        } elseif ($allowProbe && $probed < ESM_HTTP_PROBES_PER_REQUEST) {
             $result = esmHttpProbe($check);
             if ($result !== null) {
                 $result['checkedAt'] = time();
                 $saved[$key] = $result;
                 $results[] = $result;
                 $probed++;
+                $changed = true;
             }
         } elseif (is_array($cached)) {
-            $cached['stale'] = true;
+            $due = true;
+            // A result that is only waiting for its refresh is not "stale" yet.
+            $cached['stale'] = $age === null || $age < 0 || $age > 3 * ESM_HTTP_CACHE_SECONDS;
             $results[] = $cached;
         } else {
+            $due = true;
             $results[] = [
                 'name' => mbSafeLimit((string) ($check['name'] ?? 'HTTP'), 80),
                 'endpoint' => '—', 'online' => null, 'reachable' => null,
@@ -1262,8 +1845,37 @@ function esmHttpChecks(): array
             ];
         }
     }
-    esmCacheWrite('http-checks', ['checks' => $saved]);
+    // Write only when something changed, and forget checks that were removed from the configuration.
+    $kept = array_intersect_key($saved, $keys);
+    if ($changed || count($kept) !== count($saved)) esmCacheWrite('http-checks', ['checks' => $kept]);
+    if ($due && !$allowProbe && esmCanDefer()) {
+        $GLOBALS['esmDeferredTasks']['http-checks'] = static fn(): array => esmHttpChecks(true);
+    }
     return $results;
+}
+// Expiry time of the certificate presented on an open TLS connection.
+function esmCertificateExpiry($client): ?int
+{
+    if (!function_exists('openssl_x509_parse')) return null;
+    $params = @stream_context_get_params($client);
+    $cert = $params['options']['ssl']['peer_certificate'] ?? null;
+    if ($cert === null) return null;
+    $parsed = @openssl_x509_parse($cert, false);
+    return is_array($parsed) && isset($parsed['validTo_time_t']) ? (int) $parsed['validTo_time_t'] : null;
+}
+// A rejected certificate is read anyway (nothing is sent on that connection), so the page can say
+// when it expired. This is exactly when the date is most useful.
+function esmRejectedCertificateExpiry(string $endpoint, string $hostname, float $timeout): ?int
+{
+    $context = stream_context_create(['ssl' => [
+        'verify_peer' => false, 'verify_peer_name' => false,
+        'peer_name' => $hostname, 'SNI_enabled' => true, 'capture_peer_cert' => true,
+    ]]);
+    $client = @stream_socket_client('tls://' . $endpoint, $errno, $errorString, $timeout, STREAM_CLIENT_CONNECT, $context);
+    if (!is_resource($client)) return null;
+    $expiry = esmCertificateExpiry($client);
+    fclose($client);
+    return $expiry;
 }
 function esmHttpProbe(array $item): ?array
 {
@@ -1312,6 +1924,11 @@ function esmHttpProbe(array $item): ?array
         $details = $errorString . "\n" . implode("\n", $messages);
         if ($tls && preg_match('/certificate verify failed|did not match expected CN|peer certificate/i', $details)) {
             $result['error'] = 'tlsCertificateError';
+            $expiry = esmRejectedCertificateExpiry($endpoint, $hostname, max(0.2, ESM_HTTP_TIMEOUT_SECONDS / 2));
+            if ($expiry !== null) {
+                $result['tlsExpiry'] = gmdate('Y-m-d', $expiry);
+                $result['tlsDays'] = (int) floor(($expiry - time()) / 86400);
+            }
         } elseif ($errno === 111 || stripos($errorString, 'refused') !== false) {
             $result['error'] = 'connectionRefused';
         } elseif ($errno === 110 || stripos($errorString, 'timed out') !== false) {
@@ -1321,7 +1938,7 @@ function esmHttpProbe(array $item): ?array
     }
     $defaultPort = $tls ? 443 : 80;
     $request = "GET " . $path . " HTTP/1.1\r\nHost: " . $hostname . ($port !== $defaultPort ? ':' . $port : '')
-        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/1.3.0\r\nAccept: */*\r\n\r\n";
+        . "\r\nConnection: close\r\nUser-Agent: Monitor-made-Simple/" . ESM_VERSION . "\r\nAccept: */*\r\n\r\n";
     stream_set_blocking($client, false);
     $pending = $request;
     $headers = '';
@@ -1350,13 +1967,15 @@ function esmHttpProbe(array $item): ?array
     $headEnd = strpos($headers, "\r\n\r\n");
     if ($headEnd === false) $headEnd = strpos($headers, "\n\n");
     $headerOnly = $headEnd === false ? $headers : substr($headers, 0, $headEnd);
-    $marker = $isSelf && (bool) preg_match('/(?:^|\r?\n)X-Monitor-Made-Simple:\s*1\./i', $headerOnly);
+    $marker = $isSelf && (bool) preg_match('/(?:^|\r?\n)X-Monitor-Made-Simple:\s*1/i', $headerOnly);
     $result['latencyMs'] = round((microtime(true) - $start) * 1000, 1);
     if (is_string($line) && preg_match('~^HTTP/\d(?:\.\d)?\s+(\d{3})~i', $line, $m)) {
         $status = (int) $m[1];
         $result['httpStatus'] = $status;
         $result['reachable'] = true;
-        $result['online'] = ($status >= 200 && $status < 400) || ($isSelf && $status === 401);
+        // The local probe carries no password (401), and may arrive in plain HTTP on a server that
+        // requires HTTPS (403): with the monitor's marker, both prove that the page is being served.
+        $result['online'] = ($status >= 200 && $status < 400) || ($isSelf && in_array($status, [401, 403], true));
         $result['error'] = $result['online'] ? null : 'httpFailure';
         if ($isSelf && !$marker) {
             $result['online'] = false;
@@ -1367,24 +1986,281 @@ function esmHttpProbe(array $item): ?array
         $result['reachable'] = $headers !== '';
         $result['error'] = ($headers === '' && !$complete && microtime(true) >= $deadline) ? 'httpTimeout' : 'invalidResponse';
     }
-    if ($tls && function_exists('openssl_x509_parse')) {
-        $params = @stream_context_get_params($client);
-        $cert = $params['options']['ssl']['peer_certificate'] ?? null;
-        if ($cert !== null) {
-            $parsed = @openssl_x509_parse($cert, false);
-            if (is_array($parsed) && isset($parsed['validTo_time_t'])) {
-                $end = (int) $parsed['validTo_time_t'];
-                $result['tlsExpiry'] = gmdate('Y-m-d', $end);
-                $result['tlsDays'] = (int) floor(($end - time()) / 86400);
-            }
-        }
+    if ($tls && ($end = esmCertificateExpiry($client)) !== null) {
+        $result['tlsExpiry'] = gmdate('Y-m-d', $end);
+        $result['tlsDays'] = (int) floor(($end - time()) / 86400);
     }
     fclose($client);
     return $result;
 }
 
 // =============================================================
-// 15. JSON API
+// 14b. PHP RUNTIME, KERNEL LIMITS AND SOFTWARE RAID
+// =============================================================
+// Remembers when a counter last went up (out-of-memory kills, PHP-FPM process limit reached...).
+// The first observation, or a counter that went back down (reboot, restart), is not an event.
+function esmCounterChangedAt(string $name, ?float $value): ?int
+{
+    if ($value === null) return null;
+    $state = esmCacheRead('counter-' . $name);
+    if (!is_array($state) || !is_numeric($state['value'] ?? null) || $value < (float) $state['value']) {
+        esmCacheWrite('counter-' . $name, ['value' => $value, 'changedAt' => null]);
+        return null;
+    }
+    if ($value > (float) $state['value']) {
+        esmCacheWrite('counter-' . $name, ['value' => $value, 'changedAt' => time()]);
+        return time();
+    }
+    return is_numeric($state['changedAt'] ?? null) ? (int) $state['changedAt'] : null;
+}
+function esmKernel(): array
+{
+    $vmstat = esmRead('/proc/vmstat', 131072);
+    $oom = $vmstat !== null && preg_match('/^oom_kill\s+(\d+)$/m', $vmstat, $m) ? (float) $m[1] : null;
+    $pair = static function (?string $usedText, ?string $maxText): ?array {
+        $used = esmNumber($usedText);
+        $max = esmNumber($maxText);
+        return $used !== null && $max !== null && $max > 0 ? ['used' => $used, 'max' => $max] : null;
+    };
+    $fileNr = preg_split('/\s+/', trim((string) esmRead('/proc/sys/fs/file-nr', 128))) ?: [];
+    return [
+        'oomKills' => $oom,
+        'oomLastAt' => esmCounterChangedAt('oom', $oom),
+        'openFiles' => count($fileNr) >= 3 ? $pair($fileNr[0], $fileNr[2]) : null,
+        'conntrack' => $pair(esmRead('/proc/sys/net/netfilter/nf_conntrack_count', 64),
+            esmRead('/proc/sys/net/netfilter/nf_conntrack_max', 64)),
+    ];
+}
+// Linux software RAID (md). $text is only passed by tests.
+function esmRaid(?string $text = null): array
+{
+    $text ??= esmRead('/proc/mdstat', 65536);
+    if ($text === null) return [];
+    $out = [];
+    $current = null;
+    foreach (explode("\n", $text) as $line) {
+        if (preg_match('/^(md[\w-]*)\s*:\s*(\S+)(?:\s+\([^)]*\))?(?:\s+(raid\d+|linear|multipath|faulty))?/', $line, $m)) {
+            $out[] = ['name' => $m[1], 'state' => $m[2], 'level' => $m[3] ?? null,
+                'devices' => null, 'working' => null, 'degraded' => $m[2] !== 'active', 'sync' => null];
+            $current = count($out) - 1;
+            continue;
+        }
+        if ($current === null) continue;
+        if (preg_match('/\[(\d+)\/(\d+)\]\s*\[([U_]+)\]/', $line, $m)) {
+            $out[$current]['devices'] = (int) $m[1];
+            $out[$current]['working'] = (int) $m[2];
+            if ((int) $m[2] < (int) $m[1] || str_contains($m[3], '_')) $out[$current]['degraded'] = true;
+        }
+        if (preg_match('/\b(recovery|resync|reshape|check)\s*=\s*([\d.]+)%/', $line, $m)) {
+            $out[$current]['sync'] = ['action' => $m[1], 'percent' => (float) $m[2]];
+        }
+    }
+    return array_slice($out, 0, 16);
+}
+function esmPhpRuntime(): array
+{
+    $out = [
+        'version' => PHP_VERSION, 'sapi' => PHP_SAPI,
+        'memoryLimit' => mbSafeLimit((string) ini_get('memory_limit'), 20),
+        'fpm' => null, 'opcache' => null,
+    ];
+    if (function_exists('fpm_get_status')) {
+        $status = @fpm_get_status();
+        if (is_array($status)) {
+            $int = static fn(string $key): ?int => is_numeric($status[$key] ?? null) ? (int) $status[$key] : null;
+            $out['fpm'] = [
+                'pool' => mbSafeLimit((string) ($status['pool'] ?? ''), 60),
+                'manager' => mbSafeLimit((string) ($status['process-manager'] ?? ''), 20),
+                'active' => $int('active-processes'), 'idle' => $int('idle-processes'), 'total' => $int('total-processes'),
+                'listenQueue' => $int('listen-queue'), 'maxListenQueue' => $int('max-listen-queue'),
+                'maxChildrenReached' => $int('max-children-reached'), 'slowRequests' => $int('slow-requests'),
+                'accepted' => $int('accepted-conn'), 'startedSeconds' => $int('start-since'),
+            ];
+            $reached = $out['fpm']['maxChildrenReached'];
+            $out['fpm']['maxChildrenReachedAt'] = esmCounterChangedAt('fpm-max-' . substr(hash('sha256', $out['fpm']['pool']), 0, 12),
+                $reached === null ? null : (float) $reached);
+        }
+    }
+    if (function_exists('opcache_get_status')) {
+        $status = @opcache_get_status(false);
+        if (is_array($status) && !empty($status['opcache_enabled'])) {
+            $memory = is_array($status['memory_usage'] ?? null) ? $status['memory_usage'] : [];
+            $stats = is_array($status['opcache_statistics'] ?? null) ? $status['opcache_statistics'] : [];
+            $number = static fn($value): ?float => is_numeric($value) ? (float) $value : null;
+            $out['opcache'] = [
+                'used' => $number($memory['used_memory'] ?? null),
+                'free' => $number($memory['free_memory'] ?? null),
+                'wasted' => $number($memory['wasted_memory'] ?? null),
+                'scripts' => $number($stats['num_cached_scripts'] ?? null),
+                'keys' => $number($stats['num_cached_keys'] ?? null),
+                'maxKeys' => $number($stats['max_cached_keys'] ?? null),
+                'hitRate' => $number($stats['opcache_hit_rate'] ?? null),
+                'full' => !empty($status['cache_full']),
+            ];
+        }
+    }
+    return $out;
+}
+function esmTemperaturesCached(): array
+{
+    return esmCachedCollect('temperatures', 10, static fn(): array => esmTemperatures());
+}
+// HTTPS, or a direct connection from the machine itself (SSH tunnel, local browser).
+function esmTransportSecure(): bool
+{
+    if (ESM_CLI || esmIsHttps()) return true;
+    $remote = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    $forwarded = isset($_SERVER['HTTP_X_FORWARDED_FOR']) || isset($_SERVER['HTTP_X_FORWARDED_PROTO']) || isset($_SERVER['HTTP_FORWARDED']);
+    return !$forwarded && ($remote === '::1' || str_starts_with($remote, '127.'));
+}
+
+// =============================================================
+// 14c. ALERTS
+// =============================================================
+// One list of alerts for the page, ?api=health, ?api=metrics and --check.
+// level 1 = warning, 2 = critical. "key" is a text key of the page; "args" fills its {placeholders}
+// ("detail" is appended after a colon). $withUsage adds memory and disk usage with the server-side
+// thresholds; the page checks those itself, with the thresholds chosen in its settings.
+function esmAlerts(array $data, bool $withUsage): array
+{
+    $alerts = [];
+    $add = static function (int $level, string $key, array $args = [], ?string $view = null) use (&$alerts): void {
+        $alerts[] = ['level' => $level, 'key' => $key, 'args' => $args, 'view' => $view];
+    };
+    $percent = static fn(float $value): string => rtrim(rtrim(number_format($value, 1, '.', ''), '0'), '.') . '%';
+    $names = static fn(array $list): string => implode(', ', array_slice($list, 0, 3)) . (count($list) > 3 ? '…' : '');
+
+    if (($data['secure'] ?? true) === false) $add(1, 'alertInsecure');
+    if (($data['cache'] ?? true) === false) $add(1, 'alertNoCache');
+
+    if ($withUsage) {
+        $ram = $data['memory']['ram'] ?? null;
+        if (is_array($ram) && ($ram['total'] ?? 0) > 0) {
+            $used = 100 * $ram['used'] / $ram['total'];
+            if ($used >= ESM_WARN_MEMORY_PERCENT) $add($used >= min(99, ESM_WARN_MEMORY_PERCENT + 10) ? 2 : 1, 'memory', ['detail' => $percent($used)], 'processes');
+        }
+        foreach ($data['disks'] ?? [] as $disk) {
+            if (($disk['total'] ?? 0) <= 0) continue;
+            $used = 100 * $disk['used'] / $disk['total'];
+            if ($used >= ESM_WARN_DISK_PERCENT) $add($used >= min(99, ESM_WARN_DISK_PERCENT + 10) ? 2 : 1, 'alertDisk', ['mount' => $disk['mount'], 'detail' => $percent($used)], 'hardware');
+            $inodes = $disk['inodes'] ?? null;
+            if (is_array($inodes) && ($inodes['total'] ?? 0) > 0 && 100 * $inodes['used'] / $inodes['total'] >= 90) {
+                $add(100 * $inodes['used'] / $inodes['total'] >= 99 ? 2 : 1, 'alertInodes', ['mount' => $disk['mount'], 'detail' => $percent(100 * $inodes['used'] / $inodes['total'])], 'hardware');
+            }
+        }
+    }
+
+    $cores = (int) ($data['system']['logicalCores'] ?? 0);
+    $load = $data['system']['load'][1] ?? null;
+    if ($cores > 0 && is_numeric($load) && $load / $cores >= ESM_WARN_LOAD_PER_CORE) {
+        $add($load / $cores >= 2 * ESM_WARN_LOAD_PER_CORE ? 2 : 1, 'alertLoad', ['load' => number_format((float) $load, 2, '.', ''), 'cores' => $cores], 'processes');
+    }
+    foreach (['memory' => 'pressureMemory', 'io' => 'pressureIo'] as $field => $key) {
+        $avg = $data['pressure'][$field]['avg10'] ?? null;
+        if (is_numeric($avg) && $avg >= 10) $add($avg >= 30 ? 2 : 1, $key, ['detail' => 'PSI ' . $percent((float) $avg)], 'system');
+    }
+    $kernel = $data['kernel'] ?? [];
+    if (is_numeric($kernel['oomLastAt'] ?? null) && time() - (int) $kernel['oomLastAt'] < 3600) $add(2, 'alertOom', [], 'system');
+    foreach (['openFiles' => 'alertFiles', 'conntrack' => 'alertConntrack'] as $field => $key) {
+        $limit = $kernel[$field] ?? null;
+        if (is_array($limit) && $limit['max'] > 0 && 100 * $limit['used'] / $limit['max'] >= 80) {
+            $add(100 * $limit['used'] / $limit['max'] >= 95 ? 2 : 1, $key, ['detail' => $percent(100 * $limit['used'] / $limit['max'])], $field === 'conntrack' ? 'network' : 'system');
+        }
+    }
+    foreach ($data['raid'] ?? [] as $array) {
+        if (!empty($array['degraded'])) $add(2, 'alertRaidDegraded', ['detail' => $array['name']], 'hardware');
+        elseif (is_array($array['sync'] ?? null) && $array['sync']['action'] !== 'check') {
+            $add(1, 'alertRaidSync', ['detail' => $array['name'] . ' ' . $percent((float) $array['sync']['percent'])], 'hardware');
+        }
+    }
+    foreach ($data['temperatures'] ?? [] as $sensor) {
+        $limit = match ($sensor['kind'] ?? '') { 'cpu' => ESM_WARN_CPU_CELSIUS, 'disk' => ESM_WARN_DISK_CELSIUS, default => null };
+        if ($limit === null || !is_numeric($sensor['celsius'] ?? null) || $sensor['celsius'] < $limit) continue;
+        $label = trim(($sensor['kind'] === 'disk' ? (string) ($sensor['name'] ?? '') . ' ' : '') . round((float) $sensor['celsius']) . ' °C');
+        $add($sensor['celsius'] >= $limit + 10 ? 2 : 1, $sensor['kind'] === 'cpu' ? 'tempCpu' : 'tempDisk', ['detail' => $label], 'hardware');
+    }
+
+    if (!empty($data['reboot']['required'])) $add(1, 'healthReboot', [], 'system');
+    $failed = array_column($data['failedUnits']['units'] ?? [], 'unit');
+    if ($failed) $add(1, 'healthFailedUnits', ['detail' => $names($failed)], 'system');
+    $fpm = $data['php']['fpm'] ?? null;
+    if (is_array($fpm)) {
+        if (($fpm['listenQueue'] ?? 0) > 0) $add(1, 'alertFpmQueue', ['detail' => (string) $fpm['listenQueue']], 'system');
+        if (is_numeric($fpm['maxChildrenReachedAt'] ?? null) && time() - (int) $fpm['maxChildrenReachedAt'] < 3600) $add(1, 'alertFpmMax', [], 'system');
+    }
+    if (!empty($data['php']['opcache']['full'])) $add(1, 'alertOpcacheFull', [], 'system');
+
+    foreach ($data['ports'] ?? [] as $port) {
+        if (empty($port['sensitive']) || in_array((int) $port['port'], ESM_PORT_ALERT_IGNORE, true)) continue;
+        $args = ['service' => (string) ($port['service'] ?? 'TCP'), 'port' => (int) $port['port']];
+        if (($port['scope'] ?? '') === 'all') $add(1, 'alertPortAll', $args, 'network');
+        else $add(1, 'alertPortPublic', $args + ['address' => (string) $port['address']], 'network');
+    }
+    $down = array_column(array_filter($data['services'] ?? [], static fn($s): bool => empty($s['online'])), 'name');
+    if ($down) $add(1, 'services', ['detail' => $names($down)], 'network');
+    $httpDown = array_filter($data['httpChecks'] ?? [], static fn($c): bool => ($c['online'] ?? null) === false && empty($c['stale']));
+    $realDown = array_column(array_filter($httpDown, static fn($c): bool => empty($c['self'])), 'name');
+    if ($realDown) $add(2, 'httpChecks', ['detail' => $names($realDown)], 'network');
+    if (array_filter($httpDown, static fn($c): bool => !empty($c['self']))) $add(1, 'selfCheckNeedsConfig', [], 'network');
+    foreach ($data['httpChecks'] ?? [] as $check) {
+        $days = $check['tlsDays'] ?? null;
+        if (!empty($check['stale']) || !is_numeric($days) || $days >= 14) continue;
+        if ($days < 0) $add(2, 'alertTlsExpired', ['name' => (string) $check['name']], 'network');
+        elseif (!empty($check['online'])) $add($days < 3 ? 2 : 1, 'alertTls', ['name' => (string) $check['name'], 'days' => (int) $days], 'network');
+    }
+    return $alerts;
+}
+// English wording, for ?api=health and --check (the page has its own translations).
+function esmAlertText(array $alert): string
+{
+    static $english = [
+        'alertInsecure' => 'This page is served without HTTPS: the password travels unencrypted',
+        'alertNoCache' => 'The temporary directory is not writable: caches and per-process CPU are disabled',
+        'memory' => 'Memory', 'alertDisk' => 'Disk {mount}', 'alertInodes' => 'Inodes on {mount}',
+        'alertLoad' => 'High load average: {load} for {cores} cores',
+        'pressureMemory' => 'Memory pressure', 'pressureIo' => 'I/O pressure',
+        'alertOom' => 'The kernel killed a process for lack of memory in the last hour',
+        'alertFiles' => 'Open files close to the system limit',
+        'alertConntrack' => 'Connection tracking table almost full',
+        'alertRaidDegraded' => 'RAID array degraded', 'alertRaidSync' => 'RAID array rebuilding',
+        'tempCpu' => 'CPU temperature', 'tempDisk' => 'Disk temperature',
+        'healthReboot' => 'Restart required', 'healthFailedUnits' => 'Failed services',
+        'alertFpmQueue' => 'PHP-FPM: requests are waiting for a free worker',
+        'alertFpmMax' => 'PHP-FPM reached its process limit (pm.max_children) in the last hour',
+        'alertOpcacheFull' => 'OPcache memory is full',
+        'alertPortAll' => '{service} (port {port}) is listening on all interfaces',
+        'alertPortPublic' => '{service} (port {port}) is listening on the public address {address}',
+        'services' => 'Services down', 'httpChecks' => 'HTTP checks failing',
+        'selfCheckNeedsConfig' => 'Local HTTP probe failed: check the local port and virtual host configuration',
+        'alertTls' => '{name}: certificate expires in {days} d', 'alertTlsExpired' => '{name}: certificate has expired',
+    ];
+    $text = $english[$alert['key']] ?? $alert['key'];
+    foreach ($alert['args'] ?? [] as $name => $value) {
+        if ($name !== 'detail') $text = str_replace('{' . $name . '}', (string) $value, $text);
+    }
+    $detail = (string) ($alert['args']['detail'] ?? '');
+    return $detail !== '' ? $text . ': ' . $detail : $text;
+}
+function esmHealthSummary(array $data): array
+{
+    $alerts = $data['alerts'] ?? [];
+    usort($alerts, static fn(array $a, array $b): int => $b['level'] <=> $a['level']);
+    $level = $alerts ? max(array_column($alerts, 'level')) : 0;
+    return [
+        'ok' => true,
+        'status' => ['ok', 'warning', 'critical'][$level],
+        'host' => $data['system']['hostname'] ?? null,
+        'time' => date(DATE_ATOM),
+        'alerts' => array_map(static fn(array $alert): array => [
+            'level' => ['ok', 'warning', 'critical'][$alert['level']],
+            'key' => $alert['key'],
+            'message' => esmAlertText($alert),
+        ], $alerts),
+    ];
+}
+
+// =============================================================
+// 15. DATA COLLECTION, JSON API, PROMETHEUS METRICS AND COMMAND LINE
 // =============================================================
 function esmSafeCollect(string $module, callable $collector, array $fallback): array
 {
@@ -1397,51 +2273,200 @@ function esmSafeCollect(string $module, callable $collector, array $fallback): a
     }
 }
 
+// $complete = everything, with the server-side usage thresholds (health, metrics, command line).
+// Otherwise the heavier modules are only collected for the page that shows them.
+function esmCollect(string $view, bool $complete = false): array
+{
+    $collectStart = microtime(true);
+    $payload = [
+        'ok' => true,
+        'view' => $view,
+        'version' => ESM_VERSION,
+        'sampleTimeMs' => round(microtime(true) * 1000),
+        'system' => esmSafeCollect('system', 'esmSystem', []),
+        'cpu' => esmSafeCollect('cpu', 'esmCpu', ['total'=>null, 'idle'=>null, 'cores'=>[]]),
+        'memory' => esmSafeCollect('memory', 'esmMemory', ['ram'=>null, 'swap'=>null, 'swapActivity'=>null]),
+        'disks' => esmSafeCollect('disks', 'esmDisks', []),
+        'diskIo' => esmSafeCollect('diskIo', 'esmDiskIo', []),
+        'network' => esmSafeCollect('network', 'esmNetwork', []),
+        'pressure' => esmSafeCollect('pressure', 'esmPressure', []),
+        'services' => esmSafeCollect('services', 'esmServices', []),
+        'httpChecks' => esmSafeCollect('httpChecks', 'esmHttpChecks', []),
+        'reboot' => esmSafeCollect('reboot', 'esmReboot', ['required' => false, 'reasons' => []]),
+        'failedUnits' => esmSafeCollect('failedUnits', 'esmFailedUnits', ['available' => false, 'units' => []]),
+        'ports' => esmSafeCollect('ports', 'esmListeningPorts', []),
+        'kernel' => esmSafeCollect('kernel', 'esmKernel', []),
+        'raid' => esmSafeCollect('raid', 'esmRaid', []),
+        'php' => esmSafeCollect('php', 'esmPhpRuntime', []),
+        'secure' => esmTransportSecure(),
+        'cache' => esmCacheDirectory() !== null,
+    ];
+    $temperatures = esmSafeCollect('temperatures', 'esmTemperaturesCached', []);
+    if (!ESM_CLI && ($view === 'overview' || $view === 'processes')) {
+        $payload['limit'] = $view === 'processes' ? ESM_PROCESS_DETAIL_LIMIT : 5;
+        $payload['processes'] = esmProcessTop(esmSafeCollect('processes', 'esmProcesses', []), $payload['limit']);
+    }
+    if ($view === 'network' && !$complete) {
+        $payload['traffic'] = esmSafeCollect('traffic', 'esmNetworkActivity', []);
+    }
+    if ($view === 'hardware' || $complete) {
+        $payload['temperatures'] = $temperatures;
+        $payload['gpus'] = esmSafeCollect('gpus', 'esmGpus', []);
+    }
+    $payload['alerts'] = esmSafeCollect('alerts', static fn(): array => esmAlerts($payload + ['temperatures' => $temperatures], $complete), []);
+    $payload['collectionMs'] = round((microtime(true) - $collectStart) * 1000, 1);
+    return $payload;
+}
+
+function esmPrometheus(array $data): string
+{
+    $lines = [];
+    $declared = [];
+    $metric = static function (string $name, string $type, string $help, $value, array $labels = []) use (&$lines, &$declared): void {
+        if (!is_numeric($value)) return;
+        if (!isset($declared[$name])) {
+            $declared[$name] = true;
+            $lines[] = '# HELP mms_' . $name . ' ' . $help;
+            $lines[] = '# TYPE mms_' . $name . ' ' . $type;
+        }
+        $pairs = [];
+        foreach ($labels as $label => $text) {
+            $pairs[] = $label . '="' . str_replace(['\\', '"', "\n"], ['\\\\', '\\"', '\\n'], (string) $text) . '"';
+        }
+        $lines[] = 'mms_' . $name . ($pairs ? '{' . implode(',', $pairs) . '}' : '') . ' ' . (is_float($value) && floor($value) !== $value ? rtrim(sprintf('%.6F', $value), '0') : sprintf('%.0F', (float) $value));
+    };
+    $system = $data['system'] ?? [];
+    $metric('info', 'gauge', 'Monitor made Simple version and host.', 1, ['version' => ESM_VERSION, 'hostname' => (string) ($system['hostname'] ?? '')]);
+    $metric('uptime_seconds', 'gauge', 'Seconds since boot.', $system['uptimeSeconds'] ?? null);
+    foreach ([1 => 0, 5 => 1, 15 => 2] as $minutes => $index) {
+        $metric('load_average', 'gauge', 'Load average.', $system['load'][$index] ?? null, ['minutes' => $minutes]);
+    }
+    $metric('cpu_logical_cores', 'gauge', 'Logical CPU cores.', $system['logicalCores'] ?? null);
+    $metric('cpu_ticks_total', 'counter', 'CPU time of all cores, in clock ticks.', $data['cpu']['total'] ?? null);
+    $metric('cpu_idle_ticks_total', 'counter', 'Idle and I/O wait CPU time, in clock ticks.', $data['cpu']['idle'] ?? null);
+    $ram = $data['memory']['ram'] ?? null;
+    $metric('memory_total_bytes', 'gauge', 'Installed memory.', $ram['total'] ?? null);
+    $metric('memory_used_bytes', 'gauge', 'Memory in use (total minus available).', $ram['used'] ?? null);
+    $metric('memory_available_bytes', 'gauge', 'Memory available to programs.', $ram['available'] ?? null);
+    $swap = $data['memory']['swap'] ?? null;
+    $metric('swap_total_bytes', 'gauge', 'Swap size.', $swap['total'] ?? null);
+    $metric('swap_used_bytes', 'gauge', 'Swap in use.', $swap['used'] ?? null);
+    foreach ($data['disks'] ?? [] as $disk) {
+        $labels = ['mount' => $disk['mount'], 'type' => $disk['type']];
+        $metric('filesystem_size_bytes', 'gauge', 'Filesystem size.', $disk['total'], $labels);
+        $metric('filesystem_used_bytes', 'gauge', 'Filesystem space in use.', $disk['used'], $labels);
+        $metric('filesystem_inodes', 'gauge', 'Filesystem inodes.', $disk['inodes']['total'] ?? null, $labels);
+        $metric('filesystem_inodes_used', 'gauge', 'Filesystem inodes in use.', $disk['inodes']['used'] ?? null, $labels);
+    }
+    foreach ($data['diskIo'] ?? [] as $device) {
+        $metric('disk_read_bytes_total', 'counter', 'Bytes read from the device.', $device['readBytes'], ['device' => $device['name']]);
+        $metric('disk_written_bytes_total', 'counter', 'Bytes written to the device.', $device['writeBytes'], ['device' => $device['name']]);
+    }
+    foreach ($data['network'] ?? [] as $link) {
+        $metric('network_receive_bytes_total', 'counter', 'Bytes received.', $link['rx'], ['interface' => $link['name']]);
+        $metric('network_transmit_bytes_total', 'counter', 'Bytes sent.', $link['tx'], ['interface' => $link['name']]);
+        $metric('network_errors_total', 'counter', 'Receive and transmit errors.', $link['rxErrors'] + $link['txErrors'], ['interface' => $link['name']]);
+    }
+    foreach ($data['pressure'] ?? [] as $resource => $pressure) {
+        $metric('pressure_avg10_percent', 'gauge', 'Share of time tasks waited for the resource, 10-second average.', $pressure['avg10'] ?? null, ['resource' => $resource]);
+    }
+    foreach ($data['temperatures'] ?? [] as $sensor) {
+        $metric('temperature_celsius', 'gauge', 'Temperature sensor.', $sensor['celsius'] ?? null,
+            ['kind' => $sensor['kind'] ?? '', 'name' => (string) ($sensor['name'] ?? ($sensor['index'] ?? ''))]);
+    }
+    foreach ($data['services'] ?? [] as $service) {
+        $metric('service_up', 'gauge', 'TCP service check (1 = online).', empty($service['online']) ? 0 : 1, ['name' => $service['name']]);
+    }
+    foreach ($data['httpChecks'] ?? [] as $check) {
+        if (($check['online'] ?? null) !== null) $metric('http_check_up', 'gauge', 'HTTP check (1 = online).', $check['online'] ? 1 : 0, ['name' => $check['name']]);
+        $metric('tls_certificate_days', 'gauge', 'Days before the certificate expires.', $check['tlsDays'] ?? null, ['name' => $check['name']]);
+    }
+    if (!empty($data['failedUnits']['available'])) $metric('systemd_failed_units', 'gauge', 'Failed systemd units.', count($data['failedUnits']['units'] ?? []));
+    $metric('reboot_required', 'gauge', 'A restart is required (1 = yes).', empty($data['reboot']['required']) ? 0 : 1);
+    $metric('oom_kills_total', 'counter', 'Processes killed by the kernel for lack of memory, since boot.', $data['kernel']['oomKills'] ?? null);
+    $metric('open_files', 'gauge', 'Open file handles.', $data['kernel']['openFiles']['used'] ?? null);
+    $metric('conntrack_entries', 'gauge', 'Tracked connections.', $data['kernel']['conntrack']['used'] ?? null);
+    foreach ($data['raid'] ?? [] as $array) {
+        $metric('raid_degraded', 'gauge', 'Software RAID array degraded (1 = yes).', empty($array['degraded']) ? 0 : 1, ['array' => $array['name']]);
+    }
+    $fpm = $data['php']['fpm'] ?? [];
+    $metric('php_fpm_active_processes', 'gauge', 'PHP-FPM workers serving a request.', $fpm['active'] ?? null);
+    $metric('php_fpm_total_processes', 'gauge', 'PHP-FPM workers.', $fpm['total'] ?? null);
+    $metric('php_fpm_listen_queue', 'gauge', 'Requests waiting for a PHP-FPM worker.', $fpm['listenQueue'] ?? null);
+    $metric('php_fpm_max_children_reached_total', 'counter', 'Times the PHP-FPM process limit was reached.', $fpm['maxChildrenReached'] ?? null);
+    $metric('php_opcache_used_bytes', 'gauge', 'OPcache memory in use.', $data['php']['opcache']['used'] ?? null);
+    $levels = array_column($data['alerts'] ?? [], 'level');
+    $metric('health_status', 'gauge', 'Overall health: 0 = ok, 1 = warning, 2 = critical.', $levels ? max($levels) : 0);
+    $metric('alerts', 'gauge', 'Active alerts.', count($levels));
+    return implode("\n", $lines) . "\n";
+}
+
+function esmCommandLine(array $arguments): int
+{
+    $options = array_slice($arguments, 1);
+    if (in_array('--hash', $options, true)) {
+        $terminal = function_exists('posix_isatty') && @posix_isatty(STDIN);
+        fwrite(STDERR, 'Password: ');
+        if ($terminal) @shell_exec('stty -echo 2>/dev/null');
+        $password = rtrim((string) fgets(STDIN), "\r\n");
+        if ($terminal) { @shell_exec('stty echo 2>/dev/null'); fwrite(STDERR, "\n"); }
+        if ($password === '') { fwrite(STDERR, "Empty password.\n"); return 2; }
+        echo password_hash($password, PASSWORD_DEFAULT), "\n";
+        return 0;
+    }
+    if (in_array('--check', $options, true)) {
+        $summary = esmHealthSummary(esmCollect('overview', true));
+        $code = ['ok' => 0, 'warning' => 1, 'critical' => 2][$summary['status']];
+        if (in_array('--json', $options, true)) {
+            echo json_encode($summary, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE), "\n";
+        } elseif ($code > 0 || !in_array('--quiet', $options, true)) {
+            echo strtoupper($summary['status']), ' - ', $summary['host'] ?? 'server', ' - ', $summary['time'], "\n";
+            foreach ($summary['alerts'] as $alert) echo '  [', $alert['level'], '] ', $alert['message'], "\n";
+        }
+        return $code;
+    }
+    echo "Monitor made Simple " . ESM_VERSION . "\n",
+        "  php " . basename(__FILE__) . " --hash             ask for a password, print the hash for ESM_PASSWORD_HASH\n",
+        "  php " . basename(__FILE__) . " --check            health summary; exit code 0 = ok, 1 = warning, 2 = critical\n",
+        "  php " . basename(__FILE__) . " --check --quiet    print nothing when everything is fine\n",
+        "  php " . basename(__FILE__) . " --check --json     same summary as ?api=health\n";
+    return 0;
+}
+if (ESM_CLI) {
+    exit(esmCommandLine($_SERVER['argv'] ?? []));
+}
+
 if (isset($_GET['api'])) {
-    header('Content-Type: application/json; charset=utf-8');
-    if ($_GET['api'] !== 'stats') {
+    $api = is_string($_GET['api']) ? $_GET['api'] : '';
+    if (!in_array($api, ['stats', 'health', 'metrics'], true)) {
         http_response_code(404);
+        header('Content-Type: application/json; charset=utf-8');
         echo json_encode(['ok' => false, 'error' => 'Not found']);
         exit;
     }
     $apiView = in_array($_GET['view'] ?? '', ['overview', 'system', 'network', 'hardware', 'processes'], true)
         ? (string) $_GET['view'] : 'overview';
     try {
-        $collectStart = microtime(true);
-        $payload = [
-            'ok' => true,
-            'view' => $apiView,
-            'version' => '1.3.0',
-            'sampleTimeMs' => round(microtime(true) * 1000),
-            'system' => esmSafeCollect('system', 'esmSystem', []),
-            'cpu' => esmSafeCollect('cpu', 'esmCpu', ['total'=>null, 'idle'=>null, 'cores'=>[]]),
-            'memory' => esmSafeCollect('memory', 'esmMemory', ['ram'=>null, 'swap'=>null, 'swapActivity'=>null]),
-            'disks' => esmSafeCollect('disks', 'esmDisks', []),
-            'diskIo' => esmSafeCollect('diskIo', 'esmDiskIo', []),
-            'network' => esmSafeCollect('network', 'esmNetwork', []),
-            'pressure' => esmSafeCollect('pressure', 'esmPressure', []),
-            'services' => esmSafeCollect('services', 'esmServices', []),
-            'httpChecks' => esmSafeCollect('httpChecks', 'esmHttpChecks', []),
-            'reboot' => esmSafeCollect('reboot', 'esmReboot', ['required' => false, 'reasons' => []]),
-            'failedUnits' => esmSafeCollect('failedUnits', 'esmFailedUnits', ['available' => false, 'units' => []]),
-            'ports' => esmSafeCollect('ports', 'esmListeningPorts', []),
-        ];
-        // Heavier modules are only collected for the page that shows them.
-        if ($apiView === 'overview' || $apiView === 'processes') {
-            $payload['limit'] = $apiView === 'processes' ? ESM_PROCESS_DETAIL_LIMIT : 5;
-            $payload['processes'] = esmProcessTop(esmSafeCollect('processes', 'esmProcesses', []), $payload['limit']);
+        if ($api === 'metrics') {
+            $body = esmPrometheus(esmCollect('overview', true));
+            header('Content-Type: text/plain; version=0.0.4; charset=utf-8');
+        } elseif ($api === 'health') {
+            $summary = esmHealthSummary(esmCollect('overview', true));
+            $body = json_encode($summary, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            header('Content-Type: application/json; charset=utf-8');
+            if ($summary['status'] === 'critical' || ($summary['status'] === 'warning' && !empty($_GET['strict']))) http_response_code(503);
+        } else {
+            $body = json_encode(esmCollect($apiView), JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+            header('Content-Type: application/json; charset=utf-8');
         }
-        if ($apiView === 'hardware') {
-            $payload['temperatures'] = esmSafeCollect('temperatures', 'esmTemperatures', []);
-            $payload['gpus'] = esmSafeCollect('gpus', 'esmGpus', []);
-        }
-        $payload['collectionMs'] = round((microtime(true) - $collectStart) * 1000, 1);
-        echo json_encode($payload, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
+        echo $body;
     } catch (Throwable $error) {
         http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
         echo json_encode(['ok' => false, 'error' => 'Metrics unavailable']);
         error_log('Monitor made Simple statistics error: ' . $error->getMessage());
     }
+    esmRunDeferred();
     exit;
 }
 
@@ -1805,14 +2830,6 @@ button.control:active { transform:translateY(1px); }
 .eyebrow { font-size:.72rem; font-weight:700; letter-spacing:.055em; text-transform:none; }
 .metric-value-row { display:flex; align-items:center; justify-content:space-between; gap:7px; margin:3px 0 1px; }
 .big { margin:4px 0 5px; font-size:clamp(1.45rem,2.35vw,2.18rem); font-weight:780; letter-spacing:-.055em; font-variant-numeric:tabular-nums; white-space:nowrap; }
-.metric-symbol {
-  display:grid; place-items:center; flex:0 0 auto; width:35px; height:35px; border-radius:11px;
-  color:var(--accent); background:var(--soft); font-size:19px; opacity:.88;
-}
-.metric:nth-child(2) .metric-symbol { color:var(--good); }
-.metric:nth-child(3) .metric-symbol { color:var(--warn); }
-.metric:nth-child(4) .metric-symbol { color:#7f8ec5; }
-.metric:nth-child(5) .metric-symbol { color:var(--muted); }
 .progress { height:6px; margin:8px 0 8px; background:var(--soft); }
 .progress > i { border-radius:100px; }
 .metric .tiny { margin-top:auto; font-size:.73rem; line-height:1.35; }
@@ -1861,7 +2878,6 @@ button.control:active { transform:translateY(1px); }
 }
 @media (max-width:800px) {
   .header { margin-top:12px; }
-  .metric-symbol { width:30px; height:30px; }
 }
 @media (max-width:520px) {
   .wrap { width:calc(100% - 22px); }
@@ -1871,7 +2887,6 @@ button.control:active { transform:translateY(1px); }
   .toolbar .status { flex:1; justify-content:center; }
   .control { min-height:40px; }
   .metric { min-height:123px; padding:13px; border-radius:14px; }
-  .metric-symbol { width:28px; height:28px; border-radius:9px; font-size:16px; }
   .big { font-size:clamp(1.23rem,5.5vw,1.6rem); }
   .metric .tiny { font-size:.68rem; }
   .panel { padding:14px; border-radius:14px; }
@@ -1918,7 +2933,6 @@ button.control:active { transform:translateY(1px); }
 [data-style="pro"] .metric,[data-style="pro"] .panel {border-radius:5px;box-shadow:none;}
 [data-style="pro"] .metric {min-height:119px;padding:13px 15px;}
 [data-style="pro"] .metric::before {width:0;}
-[data-style="pro"] .metric-symbol {border-radius:4px;}
 [data-style="pro"] .big {font-weight:720;}
 [data-style="pro"] .icon {border-radius:4px;}
 [data-style="pro"] .item,[data-style="pro"] .process-item,[data-style="pro"] .chart-card {border-radius:4px;}
@@ -2006,8 +3020,7 @@ html:not([data-view="overview"]) .summary { display:none !important; }
   .site-footer .footer-text { width:100%; text-align:center; }
 }
 
-/* 1.3.0: quieter tiles, charts that can be read without hovering */
-.metric-symbol { display:none !important; }
+/* Quieter tiles, charts that can be read without hovering */
 .big { font-variant-numeric:tabular-nums; white-space:nowrap; }
 .metric .tiny { font-size:.72rem; opacity:.85; }
 .progress > i { background:var(--muted); }
@@ -2030,6 +3043,39 @@ html:not([data-view="overview"]) .summary { display:none !important; }
 .chart-pair strong { font-size:.9rem; }
 .zoom-dialog .chart-stats strong { font-size:1.3rem; }
 [data-style="operations"], [data-style="zen"] { --shadow:none; }
+
+/* 1.4.0 */
+/* Alerts: most serious first, each with its own colour */
+.health-reason { display:inline-flex; align-items:baseline; gap:6px; }
+.health-reason > i { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--warn); transform:translateY(-1px); }
+.health-reason.level-2 > i { background:var(--bad); }
+.health-reason.level-2, .health-reason.level-2 a { color:var(--text); }
+.health-more { border:1px solid var(--border); border-radius:999px; background:var(--soft); padding:1px 9px; font-size:.74rem; font-weight:700; }
+.health-more:hover, .health-more:focus-visible { border-color:var(--accent); color:var(--accent); }
+/* Connection lost: what is on screen is no longer current */
+.summary, .dashboard, .process-view, .health-banner { transition:opacity .3s; }
+[data-stale] .summary, [data-stale] .dashboard, [data-stale] .process-view, [data-stale] .health-banner { opacity:.5; }
+/* Small print stays readable */
+.chart-axis, .chart-overlay { font-size:.7rem; }
+.chart-card .chart-stats, .zoom-dialog .chart-stats { font-size:.74rem; }
+.health-disclaimer { font-size:.72rem; }
+.pressure-item small, .process-detail, .check-row .check-name small { font-size:.74rem; }
+.value.warn-text { color:var(--warn); }
+/* Network activity */
+.list-title { margin:16px 0 8px; font-size:.78rem; font-weight:700; color:var(--muted); letter-spacing:.02em; }
+.traffic-row { align-items:flex-start; }
+.traffic-row .pill { flex:0 0 auto; white-space:nowrap; }
+.traffic-row .check-name { font-variant-numeric:tabular-nums; }
+.tag { display:inline-block; margin-left:6px; padding:0 6px; border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:.68rem; font-weight:650; vertical-align:1px; }
+.status-line { display:flex; flex-wrap:wrap; gap:4px 12px; justify-content:flex-end; }
+.status-line .s4 { color:var(--warn); } .status-line .s5 { color:var(--bad); }
+.mini-bars { display:block; width:100%; height:44px; margin-top:12px; }
+.mini-bars rect { fill:var(--accent); }
+.mini-bars rect.zero { fill:var(--border); }
+.mini-axis { display:flex; justify-content:space-between; color:var(--muted); font-size:.7rem; margin-top:3px; }
+.acl-warning { margin:10px 0 0; padding:9px 11px; border:1px solid color-mix(in srgb,var(--warn) 45%,var(--border)); border-left-width:3px; border-radius:8px; background:color-mix(in srgb,var(--warn) 7%,var(--surface)); font-size:.8rem; line-height:1.5; }
+.code-hint { display:block; margin-top:8px; padding:9px 11px; border:1px solid var(--border); border-radius:8px; background:var(--soft); font:.74rem/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; user-select:all; }
+.value.bad-text { color:var(--bad); }
 </style>
 </head>
 <body>
@@ -2055,7 +3101,7 @@ html:not([data-view="overview"]) .summary { display:none !important; }
           <option value="hi">हिन्दी</option>
           <option value="ja">日本語</option>
         </select>
-        <label class="style-picker"><span data-i18n="interfaceStyle">Style</span><select class="control" id="styleChoice" aria-label="Interface style"><option value="operations" data-i18n="styleNight">Night</option><option value="zen" data-i18n="styleDim">Dusk</option><option value="pro" data-i18n="styleLight">Light</option></select></label>
+        <label class="style-picker"><span data-i18n="interfaceStyle">Style</span><select class="control" id="styleChoice" aria-label="Interface style"><option value="auto" data-i18n="styleAuto">Auto</option><option value="operations" data-i18n="styleNight">Night</option><option value="zen" data-i18n="styleDim">Dusk</option><option value="pro" data-i18n="styleLight">Light</option></select></label>
         <button type="button" class="control" id="settings" aria-label="Settings" title="Settings">⚙</button>
         <button type="button" class="control" id="refresh" aria-label="Refresh" title="Refresh">↻</button>
       </div>
@@ -2083,31 +3129,31 @@ html:not([data-view="overview"]) .summary { display:none !important; }
     <section class="summary" aria-label="At a glance">
       <div class="metric">
         <div class="eyebrow" data-i18n="cpu">CPU usage</div>
-        <div class="metric-value-row"><div class="big" id="cpuValue">—</div><span class="metric-symbol" aria-hidden="true">◉</span></div>
+        <div class="metric-value-row"><div class="big" id="cpuValue">—</div></div>
         <div class="progress"><i id="cpuBar"></i></div>
         <div class="tiny" id="cpuExtra">—</div>
       </div>
       <div class="metric">
         <div class="eyebrow" data-i18n="memory">Memory</div>
-        <div class="metric-value-row"><div class="big" id="ramValue">—</div><span class="metric-symbol" aria-hidden="true">▥</span></div>
+        <div class="metric-value-row"><div class="big" id="ramValue">—</div></div>
         <div class="progress"><i id="ramBar"></i></div>
         <div class="tiny" id="ramExtra">—</div>
       </div>
       <div class="metric">
         <div class="eyebrow" data-i18n="swap">Swap</div>
-        <div class="metric-value-row"><div class="big" id="swapValue">—</div><span class="metric-symbol" aria-hidden="true">⇄</span></div>
+        <div class="metric-value-row"><div class="big" id="swapValue">—</div></div>
         <div class="progress"><i id="swapBar"></i></div>
         <div class="tiny" id="swapExtra">—</div>
       </div>
       <div class="metric">
         <div class="eyebrow" data-i18n="disk">Disk</div>
-        <div class="metric-value-row"><div class="big" id="diskValue">—</div><span class="metric-symbol" aria-hidden="true">▤</span></div>
+        <div class="metric-value-row"><div class="big" id="diskValue">—</div></div>
         <div class="progress"><i id="diskBar"></i></div>
         <div class="tiny" id="diskExtra">—</div>
       </div>
       <div class="metric">
         <div class="eyebrow" data-i18n="uptime">Uptime</div>
-        <div class="metric-value-row"><div class="big" id="uptimeValue">—</div><span class="metric-symbol" aria-hidden="true">◷</span></div>
+        <div class="metric-value-row"><div class="big" id="uptimeValue">—</div></div>
         <div class="tiny" id="uptimeExtra">—</div>
       </div>
     </section>
@@ -2189,6 +3235,24 @@ html:not([data-view="overview"]) .summary { display:none !important; }
           <div class="help-cluster"><button type="button" class="help-button" data-help="failedNote" aria-label="Help">?</button></div>
         </section>
 
+        <section class="panel" id="panel-connections" data-panel="connections">
+          <h2><span class="icon" aria-hidden="true">⇄</span><span data-i18n="connectionsPanel">Current connections (TCP)</span></h2>
+          <div id="connectionsList"></div>
+          <div class="help-cluster"><button type="button" class="help-button" data-help="connNote" aria-label="Help">?</button></div>
+        </section>
+
+        <section class="panel" id="panel-webtraffic" data-panel="webtraffic">
+          <h2><span class="icon" aria-hidden="true">◔</span><span data-i18n="webPanel">Recent web traffic</span></h2>
+          <div id="webTrafficList"></div>
+          <div class="help-cluster"><button type="button" class="help-button" data-help="webNote" aria-label="Help">?</button></div>
+        </section>
+
+        <section class="panel" id="panel-apache" data-panel="apache">
+          <h2><span class="icon" aria-hidden="true">▶</span><span data-i18n="apachePanel">Apache, right now</span></h2>
+          <div id="apacheList"></div>
+          <div class="help-cluster"><button type="button" class="help-button" data-help="apacheNote" aria-label="Help">?</button></div>
+        </section>
+
         <section class="panel" id="panel-ports" data-panel="ports">
           <h2><span class="icon" aria-hidden="true">⇵</span><span data-i18n="listeningPorts">Listening ports (TCP)</span></h2>
           <div id="portsList"></div>
@@ -2206,6 +3270,12 @@ html:not([data-view="overview"]) .summary { display:none !important; }
         <section class="panel" id="panel-system" data-panel="system">
           <h2><span class="icon" aria-hidden="true">⌘</span><span data-i18n="system">System</span></h2>
           <div class="rows" id="systemRows"></div>
+        </section>
+
+        <section class="panel" id="panel-php" data-panel="php">
+          <h2><span class="icon" aria-hidden="true">⚙</span><span data-i18n="phpPanel">PHP</span></h2>
+          <div class="rows" id="phpRows"></div>
+          <div class="help-cluster"><button type="button" class="help-button" data-help="phpNote" aria-label="Help">?</button></div>
         </section>
 
         <section class="panel" id="panel-network" data-panel="network">
@@ -2282,7 +3352,7 @@ html:not([data-view="overview"]) .summary { display:none !important; }
       <div class="help-cluster"><button type="button" class="help-button" data-help="historyNote" aria-label="Help">?</button></div>
     </dialog>
 
-    <footer class="foot">Monitor made Simple 1.3.0 · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
+    <footer class="foot">Monitor made Simple <?= ESM_VERSION ?> · PHP <?= htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') ?> · <span data-i18n="footer">One file. No dependencies. Read-only monitoring.</span></footer>
     <footer class="site-footer" id="siteFooter" aria-label="Source code and support">
       <span class="footer-text" data-i18n="footerSource">Source code and support:</span>
       <a href="https://github.com/Fabrice-breizh" target="_blank" rel="noopener noreferrer">GitHub</a>
@@ -2295,14 +3365,92 @@ html:not([data-view="overview"]) .summary { display:none !important; }
   <script nonce="<?= $nonce ?>">
 'use strict';
 // =============================================================
-// 19. JAVASCRIPT AND I18N
+// 17. JAVASCRIPT AND I18N
 // =============================================================
 const words = {
   en: {
+    "connectionsPanel": "Current connections (TCP)",
+    "connIncoming": "Incoming",
+    "connOutgoing": "Outgoing",
+    "connLocal": "Internal (inside this server)",
+    "addressCount": "{n} IP",
+    "connByService": "Incoming, by service",
+    "connNone": "No incoming connection right now.",
+    "connOutgoingList": "Outgoing destinations",
+    "sessionsTitle": "Logged-in users (SSH, console)",
+    "sessionsNone": "Nobody is logged in.",
+    "agoText": "{s} ago",
+    "connNote": "Connections open at this instant, read from the kernel (nothing is scanned). An address is not a person: several people can share one, and many are robots. For outgoing connections, the program that opened them is not visible without root access. Traffic that goes straight to a container may not appear.",
+    "webPanel": "Recent web traffic",
+    "webRequests": "Requests ({m} min)",
+    "webVisitors": "Browsers and apps (addresses)",
+    "webBots": "Robots and scripts (addresses)",
+    "webResponses": "Responses",
+    "webSent": "Data sent",
+    "webPerMinute": "Requests per minute",
+    "nowWord": "now",
+    "webTopClients": "Most active addresses",
+    "webTopPages": "Most requested pages",
+    "webTopErrors": "Requests in error",
+    "errorCount": "errors: {n}",
+    "botTag": "robot",
+    "webNone": "No request in this period.",
+    "webPartial": "Very busy server: only the last {s} could be read.",
+    "webUnreadable": "The access log cannot be read by the web server's user ({user}). This panel stays empty until you allow it.", "webAclWarning": "Before you run this command: it lets {user} read the access logs, so every website and PHP application on this server could read them too (visitor addresses, pages requested). After the next log rotation, the new files of the folder, error log included, become readable as well. Needs the \"acl\" package. Your own access to the folder does not change.", "webAclUndo": "To undo it and return to the original permissions:",
+    "webMissing": "No access log found. Set ESM_ACCESS_LOGS at the top of the file.",
+    "webNote": "Read from the web server's access log; nothing is stored. Requests for this dashboard and requests coming from the server itself are left out. Robots are recognised by the name they announce, so some go unnoticed. The part of the address after \"?\" is hidden: it can contain secrets.",
+    "apachePanel": "Apache, right now",
+    "apacheRate": "Requests per second",
+    "apacheWorkers": "Workers (busy / total)",
+    "apacheKeepalive": "Idle connections kept open",
+    "apacheUptime": "Running for",
+    "apacheInFlight": "Requests being served",
+    "apacheIdle": "No request is being served at this instant.",
+    "apacheNotExtended": "Details per request need \"ExtendedStatus On\" in Apache's configuration.",
+    "apacheOff": "Apache's status page is not reachable ({detail}). To enable it:",
+    "apacheDisabled": "Disabled in the configuration.",
+    "apacheNote": "From Apache's status page (mod_status), requested from this machine only. The duration is the time since the request started: a long one can be a download, a video stream, or a page that is stuck. Requests per second include those of this dashboard.",
+    "alertInsecure": "No HTTPS: the password travels unencrypted",
+    "alertNoCache": "Temporary folder not writable: caches and per-process CPU are disabled",
+    "alertLoad": "High load: {load} for {cores} cores",
+    "alertOom": "A process was killed for lack of memory in the last hour",
+    "alertFiles": "Open files close to the system limit",
+    "alertConntrack": "Connection tracking table almost full",
+    "alertRaidDegraded": "RAID array degraded",
+    "alertRaidSync": "RAID array rebuilding",
+    "alertFpmQueue": "PHP-FPM: requests waiting for a free worker",
+    "alertFpmMax": "PHP-FPM reached its process limit in the last hour",
+    "alertOpcacheFull": "OPcache memory is full",
+    "alertPortAll": "{service} (port {port}) is listening on all interfaces",
+    "alertPortPublic": "{service} (port {port}) is listening on the public address {address}",
+    "alertTls": "{name}: certificate expires in {days} d",
+    "alertTlsExpired": "{name}: certificate has expired",
+    "styleAuto": "Auto",
+    "tlsExpired": "Certificate expired on",
+    "lastDataAgo": "Last data received {s} ago.",
+    "showAllAlerts": "Show all alerts",
+    "phpPanel": "PHP",
+    "phpSapi": "Server interface",
+    "memoryLimit": "Memory limit per request",
+    "fpmPool": "PHP-FPM pool",
+    "fpmWorkers": "Workers (busy / total)",
+    "fpmQueue": "Requests waiting",
+    "fpmMaxReached": "Process limit reached",
+    "fpmSlow": "Slow requests",
+    "opcacheMemory": "OPcache memory",
+    "opcacheHitRate": "OPcache hit rate",
+    "opcacheScripts": "Cached scripts",
+    "disabledState": "Disabled",
+    "phpNote": "PHP-FPM figures are those of the pool that serves this page. \"Process limit reached\" counts how many times pm.max_children was hit since PHP-FPM started: if it keeps growing, requests are queuing.",
+    "openFiles": "Open files",
+    "conntrack": "Tracked connections",
+    "oomKills": "Processes killed for lack of memory (since boot)",
+    "raidHealthy": "healthy",
+    "raidDegraded": "degraded",
+    "raidRebuilding": "rebuilding",
+    "raidChecking": "checking",
     "contextHelp": "Help",
-    "currentValue": "Current",
     "maxValue": "Peak",
-    "maxShort": "max",
     "selfCheck": "This monitor (local probe)",
     "selfCheckExplanation": "Local probe with fixed IP. The TLS name is inferred from SERVER_NAME (or explicitly configured). Public TLS may require a separate HTTPS check.",
     "selfCheckNeedsConfig": "Local HTTP probe failed: check the local port and virtual host configuration.",
@@ -2311,7 +3459,6 @@ const words = {
     "lastCheck": "Last checked",
     "staleResult": "stale result",
     "processPss": "PSS",
-    "processRss": "RSS",
     "processPartial": "Process list sampled (limit reached); CPU = 100% for one logical core.",
     "apiDuration": "API collection time",
     "processes": "Top processes",
@@ -2356,7 +3503,6 @@ const words = {
     "connectionRefused": "Connection refused (nothing is listening on this port)",
     "httpTimeout": "No answer in time (timeout)",
     "tlsCertificateError": "TLS certificate rejected (expired, self-signed or wrong name)",
-    "healthPublicPort": "listening on the public address",
     "viewOverview": "Overview",
     "viewSystem": "System",
     "viewNetwork": "Network",
@@ -2382,7 +3528,6 @@ const words = {
     "rebootPackages": "updated packages",
     "healthReboot": "Restart required",
     "healthFailedUnits": "Failed services",
-    "healthExposedPort": "listening on all interfaces",
     "yes": "Yes",
     "styleNight": "Night",
     "styleDim": "Dusk",
@@ -2399,7 +3544,6 @@ const words = {
     "gpuTemp": "GPU temperature",
     "gpuPower": "GPU power",
     "gpuClock": "GPU clock",
-    "openDetail": "Open the top 20 in a new tab",
     "detailTitle": "Top 20 processes",
     "top20Cpu": "Top 20 · CPU",
     "top20Ram": "Top 20 · RAM",
@@ -2467,7 +3611,6 @@ const words = {
     "hours": "h",
     "minutes": "min",
     "temperature": "Temperature",
-    "changeTheme": "Change theme",
     "refresh": "Refresh",
     "language": "Language",
     "swapGraph": "Swap · last 3 min",
@@ -2515,10 +3658,87 @@ const words = {
     "available": "Available"
   },
   fr: {
+    "connectionsPanel": "Connexions en cours (TCP)",
+    "connIncoming": "Entrantes",
+    "connOutgoing": "Sortantes",
+    "connLocal": "Internes (dans ce serveur)",
+    "addressCount": "{n} IP",
+    "connByService": "Entrantes, par service",
+    "connNone": "Aucune connexion entrante en ce moment.",
+    "connOutgoingList": "Destinations sortantes",
+    "sessionsTitle": "Utilisateurs connectés (SSH, console)",
+    "sessionsNone": "Personne n'est connecté.",
+    "agoText": "il y a {s}",
+    "connNote": "Connexions ouvertes à cet instant, lues dans le noyau (rien n'est scanné). Une adresse n'est pas une personne : plusieurs personnes peuvent en partager une, et beaucoup sont des robots. Pour les connexions sortantes, le programme qui les a ouvertes n'est pas visible sans accès root. Le trafic qui va directement vers un conteneur peut ne pas apparaître.",
+    "webPanel": "Trafic web récent",
+    "webRequests": "Requêtes ({m} min)",
+    "webVisitors": "Navigateurs et applications (adresses)",
+    "webBots": "Robots et scripts (adresses)",
+    "webResponses": "Réponses",
+    "webSent": "Données envoyées",
+    "webPerMinute": "Requêtes par minute",
+    "nowWord": "maintenant",
+    "webTopClients": "Adresses les plus actives",
+    "webTopPages": "Pages les plus demandées",
+    "webTopErrors": "Requêtes en erreur",
+    "errorCount": "erreurs : {n}",
+    "botTag": "robot",
+    "webNone": "Aucune requête sur cette période.",
+    "webPartial": "Serveur très sollicité : seules les {s} les plus récentes ont pu être lues.",
+    "webUnreadable": "Le journal d'accès n'est pas lisible par l'utilisateur du serveur web ({user}). Ce panneau reste vide tant que vous ne l'autorisez pas.", "webAclWarning": "Avant de lancer cette commande : elle autorise {user} à lire les journaux d'accès, donc tous les sites et applications PHP de ce serveur pourront les lire aussi (adresses des visiteurs, pages demandées). Après la prochaine rotation des journaux, les nouveaux fichiers du dossier, journal d'erreurs compris, deviennent lisibles eux aussi. Nécessite le paquet « acl ». Votre propre accès au dossier ne change pas.", "webAclUndo": "Pour annuler et revenir aux droits d'origine :",
+    "webMissing": "Aucun journal d'accès trouvé. Renseignez ESM_ACCESS_LOGS en haut du fichier.",
+    "webNote": "Lu dans le journal d'accès du serveur web ; rien n'est conservé. Les requêtes vers ce tableau de bord et celles qui viennent du serveur lui-même sont exclues. Les robots sont reconnus au nom qu'ils annoncent : certains passent donc inaperçus. La partie de l'adresse après « ? » est masquée, car elle peut contenir des secrets.",
+    "apachePanel": "Apache, en ce moment",
+    "apacheRate": "Requêtes par seconde",
+    "apacheWorkers": "Processus (occupés / total)",
+    "apacheKeepalive": "Connexions inactives gardées ouvertes",
+    "apacheUptime": "En service depuis",
+    "apacheInFlight": "Requêtes en cours de traitement",
+    "apacheIdle": "Aucune requête en cours à cet instant.",
+    "apacheNotExtended": "Le détail par requête nécessite « ExtendedStatus On » dans la configuration d'Apache.",
+    "apacheOff": "La page d'état d'Apache n'est pas joignable ({detail}). Pour l'activer :",
+    "apacheDisabled": "Désactivé dans la configuration.",
+    "apacheNote": "Issu de la page d'état d'Apache (mod_status), demandée depuis cette machine uniquement. La durée est le temps écoulé depuis le début de la requête : une longue durée peut être un téléchargement, un flux vidéo ou une page bloquée. Les requêtes par seconde comptent aussi celles de ce tableau de bord.",
+    "alertInsecure": "Pas de HTTPS : le mot de passe circule en clair",
+    "alertNoCache": "Dossier temporaire non accessible en écriture : caches et CPU par processus désactivés",
+    "alertLoad": "Charge élevée : {load} pour {cores} cœurs",
+    "alertOom": "Un processus a été arrêté par manque de mémoire depuis moins d'une heure",
+    "alertFiles": "Fichiers ouverts proches de la limite du système",
+    "alertConntrack": "Table de suivi des connexions presque pleine",
+    "alertRaidDegraded": "Grappe RAID dégradée",
+    "alertRaidSync": "Grappe RAID en reconstruction",
+    "alertFpmQueue": "PHP-FPM : requêtes en attente d'un processus libre",
+    "alertFpmMax": "PHP-FPM a atteint sa limite de processus depuis moins d'une heure",
+    "alertOpcacheFull": "Mémoire OPcache pleine",
+    "alertPortAll": "{service} (port {port}) en écoute sur toutes les interfaces",
+    "alertPortPublic": "{service} (port {port}) en écoute sur l'adresse publique {address}",
+    "alertTls": "{name} : le certificat expire dans {days} j",
+    "alertTlsExpired": "{name} : certificat expiré",
+    "styleAuto": "Auto",
+    "tlsExpired": "Certificat expiré le",
+    "lastDataAgo": "Dernières données reçues il y a {s}.",
+    "showAllAlerts": "Afficher toutes les alertes",
+    "phpSapi": "Interface serveur",
+    "memoryLimit": "Limite mémoire par requête",
+    "fpmPool": "Pool PHP-FPM",
+    "fpmWorkers": "Processus (occupés / total)",
+    "fpmQueue": "Requêtes en attente",
+    "fpmMaxReached": "Limite de processus atteinte",
+    "fpmSlow": "Requêtes lentes",
+    "opcacheMemory": "Mémoire OPcache",
+    "opcacheHitRate": "Taux de réussite OPcache",
+    "opcacheScripts": "Scripts en cache",
+    "disabledState": "Désactivé",
+    "phpNote": "Les chiffres PHP-FPM sont ceux du pool qui sert cette page. « Limite de processus atteinte » compte le nombre de fois où pm.max_children a été atteint depuis le démarrage de PHP-FPM : s'il augmente, des requêtes font la queue.",
+    "openFiles": "Fichiers ouverts",
+    "conntrack": "Connexions suivies",
+    "oomKills": "Processus arrêtés par manque de mémoire (depuis le démarrage)",
+    "raidHealthy": "sain",
+    "raidDegraded": "dégradé",
+    "raidRebuilding": "reconstruction",
+    "raidChecking": "vérification",
     "contextHelp": "Aide",
-    "currentValue": "Actuel",
     "maxValue": "Maximum",
-    "maxShort": "max.",
     "selfCheck": "Ce moniteur (sonde locale)",
     "selfCheckExplanation": "Sonde à IP locale fixe. Le nom TLS vient de SERVER_NAME (ou de la configuration). Vérifiez le TLS public avec une cible HTTPS dédiée.",
     "selfCheckNeedsConfig": "Sonde locale inaccessible : vérifier le port et le virtual host.",
@@ -2527,7 +3747,6 @@ const words = {
     "lastCheck": "Dernier contrôle",
     "staleResult": "résultat ancien",
     "processPss": "PSS",
-    "processRss": "RSS",
     "processPartial": "Processus échantillonnés (limite atteinte) ; 100 % CPU = un cœur logique.",
     "apiDuration": "Temps de collecte API",
     "processes": "Principaux processus",
@@ -2572,7 +3791,6 @@ const words = {
     "connectionRefused": "Connexion refusée (aucun service n'écoute sur ce port)",
     "httpTimeout": "Pas de réponse à temps (délai dépassé)",
     "tlsCertificateError": "Certificat TLS refusé (expiré, auto-signé ou nom incorrect)",
-    "healthPublicPort": "en écoute sur l'adresse publique",
     "viewOverview": "Vue d'ensemble",
     "viewSystem": "Système",
     "viewNetwork": "Réseau",
@@ -2598,7 +3816,6 @@ const words = {
     "rebootPackages": "paquets mis à jour",
     "healthReboot": "Redémarrage nécessaire",
     "healthFailedUnits": "Services en échec",
-    "healthExposedPort": "en écoute sur toutes les interfaces",
     "yes": "Oui",
     "styleNight": "Nuit",
     "styleDim": "Crépuscule",
@@ -2615,7 +3832,6 @@ const words = {
     "gpuTemp": "Température GPU",
     "gpuPower": "Consommation GPU",
     "gpuClock": "Fréquence GPU",
-    "openDetail": "Ouvrir le top 20 dans un nouvel onglet",
     "detailTitle": "Top 20 des processus",
     "top20Cpu": "Top 20 · CPU",
     "top20Ram": "Top 20 · RAM",
@@ -2683,7 +3899,6 @@ const words = {
     "hours": "h",
     "minutes": "min",
     "temperature": "Température",
-    "changeTheme": "Changer le thème",
     "refresh": "Actualiser",
     "language": "Langue",
     "swapGraph": "Swap · 3 dernières min",
@@ -2731,10 +3946,87 @@ const words = {
     "available": "Disponible"
   },
   es: {
+    "connectionsPanel": "Conexiones actuales (TCP)",
+    "connIncoming": "Entrantes",
+    "connOutgoing": "Salientes",
+    "connLocal": "Internas (dentro de este servidor)",
+    "addressCount": "{n} IP",
+    "connByService": "Entrantes, por servicio",
+    "connNone": "Ninguna conexión entrante en este momento.",
+    "connOutgoingList": "Destinos salientes",
+    "sessionsTitle": "Usuarios conectados (SSH, consola)",
+    "sessionsNone": "No hay nadie conectado.",
+    "agoText": "hace {s}",
+    "connNote": "Conexiones abiertas en este instante, leídas del núcleo (no se escanea nada). Una dirección no es una persona: varias personas pueden compartir una, y muchas son robots. En las conexiones salientes, el programa que las abrió no es visible sin acceso root. El tráfico que va directamente a un contenedor puede no aparecer.",
+    "webPanel": "Tráfico web reciente",
+    "webRequests": "Peticiones ({m} min)",
+    "webVisitors": "Navegadores y aplicaciones (direcciones)",
+    "webBots": "Robots y scripts (direcciones)",
+    "webResponses": "Respuestas",
+    "webSent": "Datos enviados",
+    "webPerMinute": "Peticiones por minuto",
+    "nowWord": "ahora",
+    "webTopClients": "Direcciones más activas",
+    "webTopPages": "Páginas más solicitadas",
+    "webTopErrors": "Peticiones con error",
+    "errorCount": "errores: {n}",
+    "botTag": "robot",
+    "webNone": "Ninguna petición en este periodo.",
+    "webPartial": "Servidor muy ocupado: solo se han podido leer los últimos {s}.",
+    "webUnreadable": "El usuario del servidor web ({user}) no puede leer el registro de accesos. Este panel permanece vacío hasta que lo autorice.", "webAclWarning": "Antes de ejecutar este comando: permite que {user} lea los registros de accesos, por lo que todos los sitios y aplicaciones PHP de este servidor también podrán leerlos (direcciones de los visitantes, páginas solicitadas). Tras la próxima rotación de registros, los archivos nuevos de la carpeta, incluido el registro de errores, también serán legibles. Requiere el paquete «acl». Su propio acceso a la carpeta no cambia.", "webAclUndo": "Para deshacerlo y volver a los permisos originales:",
+    "webMissing": "No se encontró ningún registro de accesos. Configure ESM_ACCESS_LOGS al principio del archivo.",
+    "webNote": "Leído del registro de accesos del servidor web; no se guarda nada. Se excluyen las peticiones a este panel y las que proceden del propio servidor. Los robots se reconocen por el nombre que anuncian, así que algunos pasan desapercibidos. La parte de la dirección después de «?» se oculta, porque puede contener secretos.",
+    "apachePanel": "Apache, ahora mismo",
+    "apacheRate": "Peticiones por segundo",
+    "apacheWorkers": "Procesos (ocupados / total)",
+    "apacheKeepalive": "Conexiones inactivas mantenidas abiertas",
+    "apacheUptime": "En servicio desde hace",
+    "apacheInFlight": "Peticiones en curso",
+    "apacheIdle": "Ninguna petición en curso en este instante.",
+    "apacheNotExtended": "El detalle por petición requiere «ExtendedStatus On» en la configuración de Apache.",
+    "apacheOff": "La página de estado de Apache no es accesible ({detail}). Para activarla:",
+    "apacheDisabled": "Desactivado en la configuración.",
+    "apacheNote": "Procede de la página de estado de Apache (mod_status), solicitada solo desde esta máquina. La duración es el tiempo transcurrido desde el inicio de la petición: una duración larga puede ser una descarga, un flujo de vídeo o una página bloqueada. Las peticiones por segundo incluyen las de este panel.",
+    "alertInsecure": "Sin HTTPS: la contraseña viaja sin cifrar",
+    "alertNoCache": "Carpeta temporal sin permiso de escritura: cachés y CPU por proceso desactivados",
+    "alertLoad": "Carga alta: {load} para {cores} núcleos",
+    "alertOom": "Un proceso fue detenido por falta de memoria en la última hora",
+    "alertFiles": "Archivos abiertos cerca del límite del sistema",
+    "alertConntrack": "Tabla de seguimiento de conexiones casi llena",
+    "alertRaidDegraded": "Matriz RAID degradada",
+    "alertRaidSync": "Matriz RAID en reconstrucción",
+    "alertFpmQueue": "PHP-FPM: peticiones esperando un proceso libre",
+    "alertFpmMax": "PHP-FPM alcanzó su límite de procesos en la última hora",
+    "alertOpcacheFull": "Memoria de OPcache llena",
+    "alertPortAll": "{service} (puerto {port}) en escucha en todas las interfaces",
+    "alertPortPublic": "{service} (puerto {port}) en escucha en la dirección pública {address}",
+    "alertTls": "{name}: el certificado caduca en {days} d",
+    "alertTlsExpired": "{name}: certificado caducado",
+    "styleAuto": "Automático",
+    "tlsExpired": "Certificado caducado el",
+    "lastDataAgo": "Últimos datos recibidos hace {s}.",
+    "showAllAlerts": "Mostrar todas las alertas",
+    "phpSapi": "Interfaz del servidor",
+    "memoryLimit": "Límite de memoria por petición",
+    "fpmPool": "Pool de PHP-FPM",
+    "fpmWorkers": "Procesos (ocupados / total)",
+    "fpmQueue": "Peticiones en espera",
+    "fpmMaxReached": "Límite de procesos alcanzado",
+    "fpmSlow": "Peticiones lentas",
+    "opcacheMemory": "Memoria de OPcache",
+    "opcacheHitRate": "Tasa de aciertos de OPcache",
+    "opcacheScripts": "Scripts en caché",
+    "disabledState": "Desactivado",
+    "phpNote": "Las cifras de PHP-FPM son las del pool que sirve esta página. «Límite de procesos alcanzado» cuenta las veces que se llegó a pm.max_children desde que arrancó PHP-FPM: si aumenta, hay peticiones en cola.",
+    "openFiles": "Archivos abiertos",
+    "conntrack": "Conexiones rastreadas",
+    "oomKills": "Procesos detenidos por falta de memoria (desde el arranque)",
+    "raidHealthy": "correcto",
+    "raidDegraded": "degradado",
+    "raidRebuilding": "reconstruyendo",
+    "raidChecking": "verificando",
     "contextHelp": "Ayuda",
-    "currentValue": "Actual",
     "maxValue": "Máximo",
-    "maxShort": "máx.",
     "selfCheck": "Este monitor (sonda local)",
     "selfCheckExplanation": "Sonda con IP local fija. El nombre TLS proviene de SERVER_NAME o la configuración. El TLS público puede necesitar otra comprobación HTTPS.",
     "selfCheckNeedsConfig": "Falla la sonda local: compruebe el puerto y el servidor virtual.",
@@ -2743,7 +4035,6 @@ const words = {
     "lastCheck": "Última comprobación",
     "staleResult": "resultado antiguo",
     "processPss": "PSS",
-    "processRss": "RSS",
     "processPartial": "Lista de procesos muestreada (límite alcanzado); 100 % = un núcleo.",
     "apiDuration": "Tiempo de recopilación API",
     "processes": "Procesos principales",
@@ -2788,7 +4079,6 @@ const words = {
     "connectionRefused": "Conexión rechazada (ningún servicio escucha en este puerto)",
     "httpTimeout": "Sin respuesta a tiempo (tiempo de espera agotado)",
     "tlsCertificateError": "Certificado TLS rechazado (caducado, autofirmado o nombre incorrecto)",
-    "healthPublicPort": "en escucha en la dirección pública",
     "viewOverview": "Resumen",
     "viewSystem": "Sistema",
     "viewNetwork": "Red",
@@ -2814,7 +4104,6 @@ const words = {
     "rebootPackages": "paquetes actualizados",
     "healthReboot": "Reinicio necesario",
     "healthFailedUnits": "Servicios con error",
-    "healthExposedPort": "en escucha en todas las interfaces",
     "yes": "Sí",
     "styleNight": "Noche",
     "styleDim": "Crepúsculo",
@@ -2831,7 +4120,6 @@ const words = {
     "gpuTemp": "Temperatura GPU",
     "gpuPower": "Consumo GPU",
     "gpuClock": "Frecuencia GPU",
-    "openDetail": "Abrir el top 20 en una nueva pestaña",
     "detailTitle": "Top 20 de procesos",
     "top20Cpu": "Top 20 · CPU",
     "top20Ram": "Top 20 · RAM",
@@ -2899,7 +4187,6 @@ const words = {
     "hours": "h",
     "minutes": "min",
     "temperature": "Temperatura",
-    "changeTheme": "Cambiar tema",
     "refresh": "Actualizar",
     "language": "Idioma",
     "swapGraph": "Swap · últimos 3 min",
@@ -2947,10 +4234,87 @@ const words = {
     "available": "Disponible"
   },
   zh: {
+    "connectionsPanel": "当前连接（TCP）",
+    "connIncoming": "入站",
+    "connOutgoing": "出站",
+    "connLocal": "内部（本服务器内）",
+    "addressCount": "{n} 个 IP",
+    "connByService": "入站连接（按服务）",
+    "connNone": "目前没有入站连接。",
+    "connOutgoingList": "出站目标",
+    "sessionsTitle": "已登录用户（SSH、控制台）",
+    "sessionsNone": "没有用户登录。",
+    "agoText": "{s} 前",
+    "connNote": "此刻打开的连接，直接从内核读取（不进行任何扫描）。一个地址不等于一个人：多人可能共用一个地址，而且很多是机器人。对于出站连接，没有 root 权限就无法知道是哪个程序打开的。直接发往容器的流量可能不会显示。",
+    "webPanel": "近期网站流量",
+    "webRequests": "请求数（{m} 分钟）",
+    "webVisitors": "浏览器和应用（地址）",
+    "webBots": "机器人和脚本（地址）",
+    "webResponses": "响应",
+    "webSent": "已发送数据",
+    "webPerMinute": "每分钟请求数",
+    "nowWord": "现在",
+    "webTopClients": "最活跃的地址",
+    "webTopPages": "请求最多的页面",
+    "webTopErrors": "出错的请求",
+    "errorCount": "错误：{n}",
+    "botTag": "机器人",
+    "webNone": "这段时间内没有请求。",
+    "webPartial": "服务器非常繁忙：只读取到最近 {s} 的记录。",
+    "webUnreadable": "网页服务器的用户（{user}）无法读取访问日志。在您授权之前，此面板将保持为空。", "webAclWarning": "执行此命令之前请注意：它允许 {user} 读取访问日志，因此本服务器上的所有网站和 PHP 应用也都能读取（访客地址、请求的页面）。下一次日志轮转之后，该文件夹中的新文件（包括错误日志）也会变为可读。需要安装“acl”软件包。您自己对该文件夹的访问权限不会改变。", "webAclUndo": "如需撤销并恢复原来的权限：",
+    "webMissing": "未找到访问日志。请在文件开头设置 ESM_ACCESS_LOGS。",
+    "webNote": "数据来自网页服务器的访问日志，不会保存任何内容。对本监控面板的请求以及来自服务器自身的请求不计入。机器人是根据其自报的名称识别的，因此有些可能未被发现。地址中“?”之后的部分已隐藏，因为其中可能包含机密信息。",
+    "apachePanel": "Apache 实时状态",
+    "apacheRate": "每秒请求数",
+    "apacheWorkers": "进程（忙碌 / 总数）",
+    "apacheKeepalive": "保持打开的空闲连接",
+    "apacheUptime": "已运行",
+    "apacheInFlight": "正在处理的请求",
+    "apacheIdle": "此刻没有正在处理的请求。",
+    "apacheNotExtended": "要显示每个请求的详情，需要在 Apache 配置中设置“ExtendedStatus On”。",
+    "apacheOff": "无法访问 Apache 状态页（{detail}）。启用方法：",
+    "apacheDisabled": "已在配置中停用。",
+    "apacheNote": "数据来自 Apache 状态页（mod_status），仅从本机请求。时长是请求开始以来经过的时间：时间很长可能是下载、视频流，或是卡住的页面。每秒请求数包含本监控面板自身的请求。",
+    "alertInsecure": "未使用 HTTPS：密码以明文传输",
+    "alertNoCache": "临时目录不可写：缓存和各进程 CPU 统计已停用",
+    "alertLoad": "负载过高：{load}（{cores} 个核心）",
+    "alertOom": "过去一小时内有进程因内存不足被终止",
+    "alertFiles": "打开的文件数接近系统上限",
+    "alertConntrack": "连接跟踪表即将占满",
+    "alertRaidDegraded": "RAID 阵列已降级",
+    "alertRaidSync": "RAID 阵列正在重建",
+    "alertFpmQueue": "PHP-FPM：有请求在等待空闲进程",
+    "alertFpmMax": "PHP-FPM 在过去一小时内达到进程数上限",
+    "alertOpcacheFull": "OPcache 内存已满",
+    "alertPortAll": "{service}（端口 {port}）正在所有网络接口上监听",
+    "alertPortPublic": "{service}（端口 {port}）正在公网地址 {address} 上监听",
+    "alertTls": "{name}：证书将在 {days} 天后过期",
+    "alertTlsExpired": "{name}：证书已过期",
+    "styleAuto": "自动",
+    "tlsExpired": "证书已于以下日期过期",
+    "lastDataAgo": "最后一次收到数据是在 {s} 前。",
+    "showAllAlerts": "显示全部警报",
+    "phpSapi": "服务器接口",
+    "memoryLimit": "单次请求内存上限",
+    "fpmPool": "PHP-FPM 进程池",
+    "fpmWorkers": "进程（忙碌 / 总数）",
+    "fpmQueue": "等待中的请求",
+    "fpmMaxReached": "达到进程数上限的次数",
+    "fpmSlow": "慢请求",
+    "opcacheMemory": "OPcache 内存",
+    "opcacheHitRate": "OPcache 命中率",
+    "opcacheScripts": "已缓存的脚本",
+    "disabledState": "已停用",
+    "phpNote": "PHP-FPM 数据来自为本页面提供服务的进程池。“达到进程数上限的次数”是 PHP-FPM 启动以来触及 pm.max_children 的次数：如果持续增加，说明有请求在排队。",
+    "openFiles": "打开的文件",
+    "conntrack": "已跟踪的连接",
+    "oomKills": "因内存不足被终止的进程（自开机以来）",
+    "raidHealthy": "正常",
+    "raidDegraded": "已降级",
+    "raidRebuilding": "重建中",
+    "raidChecking": "检查中",
     "contextHelp": "帮助",
-    "currentValue": "当前",
     "maxValue": "峰值",
-    "maxShort": "峰值",
     "selfCheck": "此监控器（本地检测）",
     "selfCheckExplanation": "固定本地 IP 探测，TLS 名称来自 SERVER_NAME 或显式配置。公网 TLS 可单独添加 HTTPS 探测。",
     "selfCheckNeedsConfig": "本地检测失败：请检查端口和虚拟主机配置。",
@@ -2959,7 +4323,6 @@ const words = {
     "lastCheck": "上次检测",
     "staleResult": "过期结果",
     "processPss": "PSS",
-    "processRss": "RSS",
     "processPartial": "进程超过上限，采用轮换抽样；100% CPU 表示一个逻辑核心。",
     "apiDuration": "API 采集耗时",
     "processes": "主要进程",
@@ -3004,7 +4367,6 @@ const words = {
     "connectionRefused": "连接被拒绝（此端口没有服务在监听）",
     "httpTimeout": "未及时响应（超时）",
     "tlsCertificateError": "TLS 证书被拒绝（已过期、自签名或名称不符）",
-    "healthPublicPort": "正在公网地址上监听",
     "viewOverview": "概览",
     "viewSystem": "系统",
     "viewNetwork": "网络",
@@ -3030,7 +4392,6 @@ const words = {
     "rebootPackages": "已更新的软件包",
     "healthReboot": "需要重启",
     "healthFailedUnits": "失败的服务",
-    "healthExposedPort": "正在所有网络接口上监听",
     "yes": "是",
     "styleNight": "夜间",
     "styleDim": "黄昏",
@@ -3047,7 +4408,6 @@ const words = {
     "gpuTemp": "GPU 温度",
     "gpuPower": "GPU 功耗",
     "gpuClock": "GPU 频率",
-    "openDetail": "在新标签页中打开前 20 名",
     "detailTitle": "进程前 20 名",
     "top20Cpu": "CPU 占用前 20",
     "top20Ram": "内存占用前 20",
@@ -3115,7 +4475,6 @@ const words = {
     "hours": "小时",
     "minutes": "分",
     "temperature": "温度",
-    "changeTheme": "更换主题",
     "refresh": "刷新",
     "language": "语言",
     "swapGraph": "交换空间 · 最近3分钟",
@@ -3163,10 +4522,87 @@ const words = {
     "available": "可用"
   },
   hi: {
+    "connectionsPanel": "वर्तमान कनेक्शन (TCP)",
+    "connIncoming": "आने वाले",
+    "connOutgoing": "जाने वाले",
+    "connLocal": "आंतरिक (इसी सर्वर के भीतर)",
+    "addressCount": "{n} IP",
+    "connByService": "आने वाले कनेक्शन, सेवा के अनुसार",
+    "connNone": "इस समय कोई आने वाला कनेक्शन नहीं है।",
+    "connOutgoingList": "जाने वाले कनेक्शन के गंतव्य",
+    "sessionsTitle": "लॉग इन उपयोगकर्ता (SSH, कंसोल)",
+    "sessionsNone": "कोई लॉग इन नहीं है।",
+    "agoText": "{s} पहले",
+    "connNote": "इस क्षण खुले कनेक्शन, सीधे कर्नेल से पढ़े गए (कुछ भी स्कैन नहीं किया जाता)। एक पता एक व्यक्ति नहीं होता: कई लोग एक ही पता साझा कर सकते हैं, और कई पते रोबोट के होते हैं। जाने वाले कनेक्शन किस प्रोग्राम ने खोले, यह root पहुँच के बिना नहीं दिखता। सीधे किसी कंटेनर तक जाने वाला ट्रैफ़िक शायद न दिखे।",
+    "webPanel": "हाल का वेब ट्रैफ़िक",
+    "webRequests": "अनुरोध ({m} मिनट)",
+    "webVisitors": "ब्राउज़र और ऐप (पते)",
+    "webBots": "रोबोट और स्क्रिप्ट (पते)",
+    "webResponses": "उत्तर",
+    "webSent": "भेजा गया डेटा",
+    "webPerMinute": "प्रति मिनट अनुरोध",
+    "nowWord": "अभी",
+    "webTopClients": "सबसे सक्रिय पते",
+    "webTopPages": "सबसे अधिक माँगे गए पृष्ठ",
+    "webTopErrors": "त्रुटि वाले अनुरोध",
+    "errorCount": "त्रुटियाँ: {n}",
+    "botTag": "रोबोट",
+    "webNone": "इस अवधि में कोई अनुरोध नहीं।",
+    "webPartial": "सर्वर बहुत व्यस्त है: केवल पिछले {s} ही पढ़े जा सके।",
+    "webUnreadable": "वेब सर्वर का उपयोगकर्ता ({user}) एक्सेस लॉग नहीं पढ़ सकता। जब तक आप अनुमति नहीं देते, यह पैनल खाली रहेगा।", "webAclWarning": "यह कमांड चलाने से पहले: यह {user} को एक्सेस लॉग पढ़ने देता है, इसलिए इस सर्वर की सभी वेबसाइटें और PHP एप्लिकेशन भी उन्हें पढ़ सकेंगे (आगंतुकों के पते, माँगे गए पृष्ठ)। अगले लॉग रोटेशन के बाद फ़ोल्डर की नई फ़ाइलें, त्रुटि लॉग सहित, भी पढ़ी जा सकेंगी। \"acl\" पैकेज आवश्यक है। फ़ोल्डर तक आपकी अपनी पहुँच नहीं बदलती।", "webAclUndo": "इसे रद्द करके मूल अनुमतियों पर लौटने के लिए:",
+    "webMissing": "कोई एक्सेस लॉग नहीं मिला। फ़ाइल के शुरू में ESM_ACCESS_LOGS सेट करें।",
+    "webNote": "वेब सर्वर के एक्सेस लॉग से पढ़ा गया; कुछ भी सहेजा नहीं जाता। इस डैशबोर्ड के अनुरोध और स्वयं सर्वर से आने वाले अनुरोध शामिल नहीं हैं। रोबोट उनके बताए नाम से पहचाने जाते हैं, इसलिए कुछ छूट सकते हैं। पते में \"?\" के बाद का भाग छिपाया जाता है, क्योंकि उसमें गोपनीय जानकारी हो सकती है।",
+    "apachePanel": "Apache, इस समय",
+    "apacheRate": "प्रति सेकंड अनुरोध",
+    "apacheWorkers": "प्रक्रियाएँ (व्यस्त / कुल)",
+    "apacheKeepalive": "खुले रखे गए निष्क्रिय कनेक्शन",
+    "apacheUptime": "चालू हुए",
+    "apacheInFlight": "इस समय संसाधित हो रहे अनुरोध",
+    "apacheIdle": "इस क्षण कोई अनुरोध संसाधित नहीं हो रहा।",
+    "apacheNotExtended": "प्रति अनुरोध विवरण के लिए Apache के कॉन्फ़िगरेशन में \"ExtendedStatus On\" चाहिए।",
+    "apacheOff": "Apache का स्थिति पृष्ठ उपलब्ध नहीं है ({detail})। इसे चालू करने के लिए:",
+    "apacheDisabled": "कॉन्फ़िगरेशन में बंद है।",
+    "apacheNote": "Apache के स्थिति पृष्ठ (mod_status) से, जो केवल इसी मशीन से माँगा जाता है। अवधि अनुरोध शुरू होने के बाद का समय है: लंबी अवधि डाउनलोड, वीडियो स्ट्रीम या अटका हुआ पृष्ठ हो सकती है। प्रति सेकंड अनुरोधों में इस डैशबोर्ड के अनुरोध भी शामिल हैं।",
+    "alertInsecure": "HTTPS नहीं है: पासवर्ड बिना एन्क्रिप्शन के भेजा जा रहा है",
+    "alertNoCache": "अस्थायी फ़ोल्डर में लिखा नहीं जा सकता: कैश और प्रति-प्रक्रिया CPU बंद हैं",
+    "alertLoad": "अधिक लोड: {cores} कोर के लिए {load}",
+    "alertOom": "पिछले एक घंटे में मेमोरी की कमी से एक प्रक्रिया बंद की गई",
+    "alertFiles": "खुली फ़ाइलें सिस्टम सीमा के करीब हैं",
+    "alertConntrack": "कनेक्शन ट्रैकिंग तालिका लगभग भर गई है",
+    "alertRaidDegraded": "RAID ऐरे डिग्रेडेड है",
+    "alertRaidSync": "RAID ऐरे का पुनर्निर्माण चल रहा है",
+    "alertFpmQueue": "PHP-FPM: अनुरोध खाली प्रक्रिया की प्रतीक्षा में हैं",
+    "alertFpmMax": "PHP-FPM पिछले एक घंटे में अपनी प्रक्रिया सीमा तक पहुँचा",
+    "alertOpcacheFull": "OPcache मेमोरी भर गई है",
+    "alertPortAll": "{service} (पोर्ट {port}) सभी इंटरफ़ेस पर सुन रहा है",
+    "alertPortPublic": "{service} (पोर्ट {port}) सार्वजनिक पते {address} पर सुन रहा है",
+    "alertTls": "{name}: प्रमाणपत्र {days} दिन में समाप्त होगा",
+    "alertTlsExpired": "{name}: प्रमाणपत्र समाप्त हो चुका है",
+    "styleAuto": "स्वचालित",
+    "tlsExpired": "प्रमाणपत्र इस तारीख को समाप्त हुआ",
+    "lastDataAgo": "अंतिम डेटा {s} पहले मिला।",
+    "showAllAlerts": "सभी चेतावनियाँ दिखाएँ",
+    "phpSapi": "सर्वर इंटरफ़ेस",
+    "memoryLimit": "प्रति अनुरोध मेमोरी सीमा",
+    "fpmPool": "PHP-FPM पूल",
+    "fpmWorkers": "प्रक्रियाएँ (व्यस्त / कुल)",
+    "fpmQueue": "प्रतीक्षारत अनुरोध",
+    "fpmMaxReached": "प्रक्रिया सीमा तक पहुँचने की संख्या",
+    "fpmSlow": "धीमे अनुरोध",
+    "opcacheMemory": "OPcache मेमोरी",
+    "opcacheHitRate": "OPcache हिट दर",
+    "opcacheScripts": "कैश की गई स्क्रिप्ट",
+    "disabledState": "बंद",
+    "phpNote": "PHP-FPM के आँकड़े उसी पूल के हैं जो यह पृष्ठ परोसता है। \"प्रक्रिया सीमा तक पहुँचने की संख्या\" बताती है कि PHP-FPM शुरू होने के बाद pm.max_children कितनी बार छुआ गया: यदि यह बढ़ रही है, तो अनुरोध कतार में हैं।",
+    "openFiles": "खुली फ़ाइलें",
+    "conntrack": "ट्रैक किए गए कनेक्शन",
+    "oomKills": "मेमोरी की कमी से बंद की गई प्रक्रियाएँ (बूट के बाद से)",
+    "raidHealthy": "ठीक",
+    "raidDegraded": "डिग्रेडेड",
+    "raidRebuilding": "पुनर्निर्माण",
+    "raidChecking": "जाँच",
     "contextHelp": "सहायता",
-    "currentValue": "वर्तमान",
     "maxValue": "अधिकतम",
-    "maxShort": "अधि.",
     "selfCheck": "यह मॉनिटर (स्थानीय जाँच)",
     "selfCheckExplanation": "स्थिर स्थानीय IP से जाँच; TLS नाम SERVER_NAME या स्पष्ट कॉन्फ़िगरेशन से आता है। सार्वजनिक TLS के लिए अलग HTTPS जाँच जोड़ें।",
     "selfCheckNeedsConfig": "स्थानीय जाँच विफल: पोर्ट और वर्चुअल होस्ट जाँचें।",
@@ -3175,7 +4611,6 @@ const words = {
     "lastCheck": "अंतिम जाँच",
     "staleResult": "पुराना परिणाम",
     "processPss": "PSS",
-    "processRss": "RSS",
     "processPartial": "प्रक्रिया सीमा पार; नमूनाकरण चालू है। 100% CPU = एक लॉजिकल कोर।",
     "apiDuration": "API संग्रह समय",
     "processes": "प्रमुख प्रक्रियाएँ",
@@ -3220,7 +4655,6 @@ const words = {
     "connectionRefused": "कनेक्शन अस्वीकृत (इस पोर्ट पर कोई सेवा नहीं सुन रही)",
     "httpTimeout": "समय पर उत्तर नहीं (टाइमआउट)",
     "tlsCertificateError": "TLS प्रमाणपत्र अस्वीकृत (समाप्त, स्व-हस्ताक्षरित या गलत नाम)",
-    "healthPublicPort": "सार्वजनिक पते पर सुन रहा है",
     "viewOverview": "सारांश",
     "viewSystem": "सिस्टम",
     "viewNetwork": "नेटवर्क",
@@ -3246,7 +4680,6 @@ const words = {
     "rebootPackages": "अपडेट किए गए पैकेज",
     "healthReboot": "रीस्टार्ट आवश्यक",
     "healthFailedUnits": "विफल सेवाएँ",
-    "healthExposedPort": "सभी इंटरफ़ेस पर सुन रहा है",
     "yes": "हाँ",
     "styleNight": "रात",
     "styleDim": "संध्या",
@@ -3263,7 +4696,6 @@ const words = {
     "gpuTemp": "GPU तापमान",
     "gpuPower": "GPU बिजली खपत",
     "gpuClock": "GPU आवृत्ति",
-    "openDetail": "शीर्ष 20 को नए टैब में खोलें",
     "detailTitle": "शीर्ष 20 प्रक्रियाएँ",
     "top20Cpu": "शीर्ष 20 · CPU",
     "top20Ram": "शीर्ष 20 · RAM",
@@ -3331,7 +4763,6 @@ const words = {
     "hours": "घं",
     "minutes": "मि",
     "temperature": "तापमान",
-    "changeTheme": "थीम बदलें",
     "refresh": "रीफ्रेश",
     "language": "भाषा",
     "swapGraph": "Swap · पिछले 3 मिनट",
@@ -3379,10 +4810,87 @@ const words = {
     "available": "उपलब्ध"
   },
   ja: {
+    "connectionsPanel": "現在の接続（TCP）",
+    "connIncoming": "受信",
+    "connOutgoing": "送信",
+    "connLocal": "内部（このサーバー内）",
+    "addressCount": "{n} IP",
+    "connByService": "受信接続（サービス別）",
+    "connNone": "現在、受信接続はありません。",
+    "connOutgoingList": "送信先",
+    "sessionsTitle": "ログイン中のユーザー（SSH、コンソール）",
+    "sessionsNone": "ログイン中のユーザーはいません。",
+    "agoText": "{s} 前",
+    "connNote": "この瞬間に開いている接続を、カーネルから直接読み取っています（スキャンは行いません）。アドレスは人ではありません。複数の人が同じアドレスを共有することがあり、多くはロボットです。送信接続を開いたプログラムは、root 権限がないと分かりません。コンテナーに直接届く通信は表示されない場合があります。",
+    "webPanel": "最近のウェブトラフィック",
+    "webRequests": "リクエスト数（{m} 分）",
+    "webVisitors": "ブラウザー・アプリ（アドレス）",
+    "webBots": "ロボット・スクリプト（アドレス）",
+    "webResponses": "レスポンス",
+    "webSent": "送信データ量",
+    "webPerMinute": "1分あたりのリクエスト数",
+    "nowWord": "現在",
+    "webTopClients": "最もアクティブなアドレス",
+    "webTopPages": "最も多くリクエストされたページ",
+    "webTopErrors": "エラーになったリクエスト",
+    "errorCount": "エラー：{n}",
+    "botTag": "ロボット",
+    "webNone": "この期間のリクエストはありません。",
+    "webPartial": "サーバーが非常に混雑しています：直近 {s} のみ読み取れました。",
+    "webUnreadable": "ウェブサーバーのユーザー（{user}）がアクセスログを読み取れません。許可するまで、このパネルは空のままです。", "webAclWarning": "このコマンドを実行する前に：{user} がアクセスログを読めるようになるため、このサーバー上のすべてのウェブサイトと PHP アプリケーションも読めるようになります（訪問者のアドレス、リクエストされたページ）。次回のログローテーション後は、フォルダー内の新しいファイル（エラーログを含む）も読み取り可能になります。「acl」パッケージが必要です。フォルダーに対するご自身のアクセス権は変わりません。", "webAclUndo": "元の権限に戻すには：",
+    "webMissing": "アクセスログが見つかりません。ファイル冒頭の ESM_ACCESS_LOGS を設定してください。",
+    "webNote": "ウェブサーバーのアクセスログから読み取っており、何も保存しません。このダッシュボードへのリクエストと、サーバー自身からのリクエストは除外されます。ロボットは名乗っている名前で判別するため、見逃されるものもあります。アドレスの「?」以降は、秘密情報を含む可能性があるため表示しません。",
+    "apachePanel": "Apache の現在の状況",
+    "apacheRate": "1秒あたりのリクエスト数",
+    "apacheWorkers": "プロセス（処理中 / 合計）",
+    "apacheKeepalive": "開いたままの待機中接続",
+    "apacheUptime": "稼働時間",
+    "apacheInFlight": "処理中のリクエスト",
+    "apacheIdle": "現在、処理中のリクエストはありません。",
+    "apacheNotExtended": "リクエストごとの詳細には、Apache の設定で「ExtendedStatus On」が必要です。",
+    "apacheOff": "Apache のステータスページに接続できません（{detail}）。有効にするには：",
+    "apacheDisabled": "設定で無効になっています。",
+    "apacheNote": "Apache のステータスページ（mod_status）から取得しており、このマシンからのみ要求します。時間はリクエスト開始からの経過時間で、長い場合はダウンロード、動画ストリーム、または止まっているページの可能性があります。1秒あたりのリクエスト数には、このダッシュボード自身のリクエストも含まれます。",
+    "alertInsecure": "HTTPS ではありません：パスワードが暗号化されずに送信されます",
+    "alertNoCache": "一時フォルダーに書き込めません：キャッシュとプロセス別 CPU は無効です",
+    "alertLoad": "高負荷：{load}（{cores} コア）",
+    "alertOom": "過去1時間以内にメモリ不足でプロセスが強制終了されました",
+    "alertFiles": "開いているファイル数がシステム上限に近づいています",
+    "alertConntrack": "接続追跡テーブルがほぼ満杯です",
+    "alertRaidDegraded": "RAID アレイが縮退しています",
+    "alertRaidSync": "RAID アレイを再構築中",
+    "alertFpmQueue": "PHP-FPM：空きプロセス待ちのリクエストがあります",
+    "alertFpmMax": "PHP-FPM が過去1時間以内にプロセス数の上限に達しました",
+    "alertOpcacheFull": "OPcache のメモリが満杯です",
+    "alertPortAll": "{service}（ポート {port}）がすべてのインターフェースで待ち受け中",
+    "alertPortPublic": "{service}（ポート {port}）がパブリックアドレス {address} で待ち受け中",
+    "alertTls": "{name}：証明書の有効期限まであと {days} 日",
+    "alertTlsExpired": "{name}：証明書の有効期限が切れています",
+    "styleAuto": "自動",
+    "tlsExpired": "証明書の有効期限切れ",
+    "lastDataAgo": "最後のデータ受信は {s} 前です。",
+    "showAllAlerts": "すべての警告を表示",
+    "phpSapi": "サーバーインターフェース",
+    "memoryLimit": "リクエストごとのメモリ上限",
+    "fpmPool": "PHP-FPM プール",
+    "fpmWorkers": "プロセス（処理中 / 合計）",
+    "fpmQueue": "待機中のリクエスト",
+    "fpmMaxReached": "プロセス数上限への到達回数",
+    "fpmSlow": "遅いリクエスト",
+    "opcacheMemory": "OPcache メモリ",
+    "opcacheHitRate": "OPcache ヒット率",
+    "opcacheScripts": "キャッシュ済みスクリプト",
+    "disabledState": "無効",
+    "phpNote": "PHP-FPM の数値は、このページを処理しているプールのものです。「プロセス数上限への到達回数」は PHP-FPM の起動以降に pm.max_children に達した回数で、増え続ける場合はリクエストが待たされています。",
+    "openFiles": "開いているファイル",
+    "conntrack": "追跡中の接続",
+    "oomKills": "メモリ不足で強制終了されたプロセス（起動以降）",
+    "raidHealthy": "正常",
+    "raidDegraded": "縮退",
+    "raidRebuilding": "再構築中",
+    "raidChecking": "チェック中",
     "contextHelp": "ヘルプ",
-    "currentValue": "現在",
     "maxValue": "最大",
-    "maxShort": "最大",
     "selfCheck": "このモニター（ローカル検査）",
     "selfCheckExplanation": "固定ローカルIPを検査し、TLS名にはSERVER_NAMEまたは明示設定を使用します。公開TLSには別のHTTPS検査が必要な場合があります。",
     "selfCheckNeedsConfig": "ローカル検査に失敗しました。ポートと仮想ホストを確認してください。",
@@ -3391,7 +4899,6 @@ const words = {
     "lastCheck": "最終チェック",
     "staleResult": "古い結果",
     "processPss": "PSS",
-    "processRss": "RSS",
     "processPartial": "プロセス数の上限により一部を抽出。CPU 100% は論理コア1個分です。",
     "apiDuration": "API 収集時間",
     "processes": "主なプロセス",
@@ -3436,7 +4943,6 @@ const words = {
     "connectionRefused": "接続が拒否されました（このポートで待ち受けているサービスがありません）",
     "httpTimeout": "時間内に応答がありません（タイムアウト）",
     "tlsCertificateError": "TLS 証明書が拒否されました（期限切れ、自己署名、または名前の不一致）",
-    "healthPublicPort": "パブリックアドレスで待ち受け中",
     "viewOverview": "概要",
     "viewSystem": "システム",
     "viewNetwork": "ネットワーク",
@@ -3462,7 +4968,6 @@ const words = {
     "rebootPackages": "更新されたパッケージ",
     "healthReboot": "再起動が必要",
     "healthFailedUnits": "失敗したサービス",
-    "healthExposedPort": "すべてのインターフェースで待ち受け中",
     "yes": "はい",
     "styleNight": "ナイト",
     "styleDim": "トワイライト",
@@ -3479,7 +4984,6 @@ const words = {
     "gpuTemp": "GPU 温度",
     "gpuPower": "GPU 消費電力",
     "gpuClock": "GPU クロック",
-    "openDetail": "上位20件を新しいタブで開く",
     "detailTitle": "プロセス上位20件",
     "top20Cpu": "CPU 上位20件",
     "top20Ram": "RAM 上位20件",
@@ -3547,7 +5051,6 @@ const words = {
     "hours": "時間",
     "minutes": "分",
     "temperature": "温度",
-    "changeTheme": "テーマ変更",
     "refresh": "更新",
     "language": "言語",
     "swapGraph": "スワップ · 過去3分",
@@ -3605,15 +5108,16 @@ const VIEW_LABELS = {overview:'viewOverview', system:'viewSystem', network:'view
 let currentView = VIEWS.includes(document.documentElement.dataset.view) ? document.documentElement.dataset.view : 'overview';
 // Panels of each page; on the overview, the order and visibility can be customized.
 const pageGroups = {
-  system: {left:['system', 'failed'], right:['pressure']},
-  network: {left:['network', 'ports'], right:['services', 'http']},
+  system: {left:['system', 'failed'], right:['php', 'pressure']},
+  network: {left:['network', 'connections', 'ports'], right:['webtraffic', 'apache', 'services', 'http']},
   hardware: {left:['hardware'], right:['storage']},
   processes: {left:[], right:[]},
 };
 const PROCESS_REFRESH_SECONDS = <?= (int) ESM_PROCESS_CACHE_SECONDS ?>;
 const BACKGROUND_REFRESH_SECONDS = <?= max(0, (int) ESM_BACKGROUND_REFRESH_SECONDS) ?>;
 const PAGE_TITLE = document.title;
-const styles = ['operations', 'pro', 'zen'];
+const APP_TITLE = <?= json_encode(ESM_TITLE, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+const styles = ['auto', 'operations', 'pro', 'zen'];
 const HISTORY_LIMIT = 600;
 
 function setting(key) {
@@ -3635,7 +5139,7 @@ const panelGroups = {
   right:['checks','processes'],
 };
 const panelLabels = {activity:'activity', processes:'processes', checks:'checksPanel'};
-const allPanels = ['activity','processes','checks','storage','services','system','failed','ports','network','http','hardware','pressure'];
+const allPanels = ['activity','processes','checks','storage','services','system','php','failed','ports','network','http','hardware','pressure','connections','webtraffic','apache'];
 function jsonSetting(key, fallback) {
   try { const value = JSON.parse(setting(key)); return value ?? fallback; }
   catch { return fallback; }
@@ -3669,6 +5173,10 @@ const state = {
   busy: false,
   connected: false,
   errorDetail: '',
+  failures: 0,
+  retryAt: 0,
+  lastSuccess: 0,
+  health: {severity: 0, count: 0},
   active: !document.hidden,
   rates: {
     cpu: null, cores: [], network: {}, disk: {},
@@ -3762,6 +5270,36 @@ function updateBar(id, value, threshold = 85) {
 function appendHistory(key, value) {
   state.history[key].push(Number.isFinite(value) ? value : null);
   if (state.history[key].length > HISTORY_LIMIT) state.history[key].shift();
+}
+// The charts survive a reload of the page (same tab, less than 15 minutes later).
+const HISTORY_KEY = 'mmsHistory:' + location.pathname;
+function saveHistory() {
+  try {
+    const round = value => Number.isFinite(value) ? Math.round(value * 100) / 100 : null;
+    const history = {};
+    for (const [key, values] of Object.entries(state.history)) history[key] = values.map(round);
+    sessionStorage.setItem(HISTORY_KEY, JSON.stringify({savedAt: Date.now(), times: state.historyTimes, history}));
+  } catch {  }
+}
+function restoreHistory() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(HISTORY_KEY));
+    const times = saved?.times;
+    if (!Array.isArray(times) || !times.length || !(Date.now() - saved.savedAt < 15 * 60000)) return;
+    const keys = Object.keys(state.history);
+    if (!keys.every(key => Array.isArray(saved.history?.[key]) && saved.history[key].length === times.length)) return;
+    state.historyTimes = times.map(Number).slice(-HISTORY_LIMIT);
+    for (const key of keys) state.history[key] = saved.history[key].map(value => Number.isFinite(value) ? value : null).slice(-HISTORY_LIMIT);
+  } catch {  }
+}
+window.addEventListener('pagehide', saveHistory);
+// True while the user is selecting text in a panel: redrawing it would drop the selection.
+function userIsSelecting() {
+  const selection = window.getSelection?.();
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return false;
+  const anchor = selection.anchorNode;
+  const element = anchor?.nodeType === 1 ? anchor : anchor?.parentElement;
+  return Boolean(element?.closest?.('.dashboard, .process-view'));
 }
 
 // =============================================================
@@ -3896,6 +5434,7 @@ function showChartSample(id, index, pointer = null) {
   const sample = Math.max(0,Math.min(count-1,index));
   data.hit.dataset.point = String(sample);
   data.hit.setAttribute('aria-valuenow',String(sample));
+  data.hit.setAttribute('aria-valuetext',chartSampleText(data,sample));
   data.hit.setAttribute('aria-label',(data.label || id) + ' · ' + chartSampleText(data,sample));
   const x = data.xs?.[sample] ?? (count === 1 ? 200 : sample * 400 / (count-1));
   data.guide.setAttribute('x1',String(x));
@@ -4023,7 +5562,8 @@ function plot(id, series, scale = 100, key = 'cpu', threshold = null) {
   const expected = refreshSeconds * 1000;
   // Background tabs are refreshed slowly (and browsers may slow them down to once a minute).
   const allowed = Math.max(3 * expected, expected + 4000, BACKGROUND_REFRESH_SECONDS > 0 ? Math.max(BACKGROUND_REFRESH_SECONDS * 2000, 65000) : 0);
-  const gap = i => i > 0 && data.times[i] - data.times[i-1] > allowed;  for (const fraction of [.25,.5,.75]) {
+  const gap = i => i > 0 && data.times[i] - data.times[i-1] > allowed;
+  for (const fraction of [.25,.5,.75]) {
     const y = chartY(fraction * max, max);
     data.drawing.append(svgEl('line',{x1:0,x2:400,y1:y,y2:y,stroke:'currentColor',opacity:'.1','vector-effect':'non-scaling-stroke'}));
   }
@@ -4182,67 +5722,46 @@ function renderHttp(data) {
         + (check.stale ? ' · ' + t('staleResult') : '')));
     }
     if (check.tls) {
-      let message = check.tlsDays === null ? t('tlsUnavailable') :
-        `${t('tlsExpires')}${localeColon()}${number(check.tlsDays,0)} ${t('days')} (${check.tlsExpiry})`;
+      const message = check.tlsDays === null ? t('tlsUnavailable')
+        : check.tlsDays < 0 ? `${t('tlsExpired')}${localeColon()}${check.tlsExpiry}`
+        : `${t('tlsExpires')}${localeColon()}${number(check.tlsDays,0)} ${t('days')} (${check.tlsExpiry})`;
       const div = node('div','smalltext',message);
-      if (check.tlsDays !== null && check.tlsDays < 14) div.style.color = 'var(--warn)';
+      if (check.tlsDays !== null && check.tlsDays < 14) div.style.color = check.tlsDays < 0 ? 'var(--bad)' : 'var(--warn)';
       item.append(div);
     }
     if (check.error) item.append(node('div','smalltext',t(check.error)));
     target.append(item);
   }
 }
+// Text of an alert computed by the server: a text key, {placeholders} and an optional detail.
+function alertText(alert) {
+  const args = alert.args && !Array.isArray(alert.args) ? alert.args : {};
+  let text = t(alert.key);
+  for (const [name, value] of Object.entries(args)) {
+    if (name !== 'detail') text = text.replaceAll('{' + name + '}', String(value));
+  }
+  return args.detail ? text + localeColon() + args.detail : text;
+}
+const HEALTH_VISIBLE = 6;
+let healthExpanded = false;
 function renderHealth(data) {
   const warnings = [];
-  let severity = 0;
-  function add(level, reason, view = null) {
-    severity = Math.max(severity,level);
-    warnings.push({reason, view});
+  const add = (level, reason, view = null) => warnings.push({level, reason, view});
+  // Thresholds chosen in the settings of this page.
+  function usage(value, threshold, label, view) {
+    if (value === null || !Number.isFinite(value) || value < threshold) return;
+    add(value >= Math.min(99, threshold + 10) ? 2 : 1, `${label}${localeColon()}${pct(value)}`, view);
   }
-  function usage(value, threshold, key) {
-    if (value === null || !Number.isFinite(value)) return;
-    if (value >= Math.min(99, threshold+10)) add(2,`${t(key)}${localeColon()}${pct(value)}`);
-    else if (value >= threshold) add(1,`${t(key)}${localeColon()}${pct(value)}`);
-  }
-  function usageIn(view, ...args) {
-    const before = warnings.length;
-    usage(...args);
-    for (let i = before; i < warnings.length; i++) warnings[i].view = view;
-  }
-  usageIn('processes', state.rates.cpu, thresholds.cpu,'cpu');
+  usage(state.rates.cpu, thresholds.cpu, t('cpu'), 'processes');
   const ram = data.memory?.ram;
-  usageIn('processes', ram ? percentage(ram.used, ram.total) : null, thresholds.ram,'memory');
+  usage(ram ? percentage(ram.used, ram.total) : null, thresholds.ram, t('memory'), 'processes');
   for (const disk of data.disks || []) {
-    usageIn('hardware', percentage(disk.used, disk.total), thresholds.disk, `${disk.mount}`);
-    if (disk.inodes) usageIn('hardware', percentage(disk.inodes.used,disk.inodes.total),90,`${disk.mount} · ${t('inodes')}`);
+    usage(percentage(disk.used, disk.total), thresholds.disk, disk.mount, 'hardware');
+    if (disk.inodes) usage(percentage(disk.inodes.used, disk.inodes.total), 90, `${disk.mount} · ${t('inodes')}`, 'hardware');
   }
-  if (data.reboot?.required) add(1, t('healthReboot'), 'system');
-  const failedUnits = data.failedUnits?.units || [];
-  if (failedUnits.length) add(1, `${t('healthFailedUnits')}${localeColon()}${failedUnits.slice(0,3).map(unit => unit.unit).join(', ')}${failedUnits.length > 3 ? '…' : ''}`, 'system');
-  for (const entry of (data.ports || []).filter(port => port.sensitive)) {
-    const where = entry.scope === 'all' ? t('healthExposedPort') : `${t('healthPublicPort')} ${entry.address}`;
-    add(1, `${entry.service || entry.port} (${entry.port}) ${where}`, 'network');
-  }
+  // Rates measured between two refreshes of this page.
   const swapping = Math.max(0, state.rates.swapIn || 0) + Math.max(0, state.rates.swapOut || 0);
-  if (swapping >= 100) add(2,`${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`, 'processes');
-  else if (swapping >= 10) add(1,`${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`, 'processes');
-  for (const [key, label] of [['memory','pressureMemory'],['io','pressureIo']]) {
-    const p = data.pressure?.[key];
-    if (p && p.avg10 >= 30) add(2,`${t(label)} PSI${localeColon()}${pct(p.avg10)}`, 'system');
-    else if (p && p.avg10 >= 10) add(1,`${t(label)} PSI${localeColon()}${pct(p.avg10)}`, 'system');
-  }
-  const tcpDown = (data.services || []).filter(s => !s.online);
-  if (tcpDown.length) add(1,`${t('services')}${localeColon()}${tcpDown.map(x=>x.name).slice(0,3).join(', ')}`, 'network');
-  const httpDown = (data.httpChecks || []).filter(s => s.online === false && !s.stale);
-  const realDown = httpDown.filter(s => !s.self);
-  const selfDown = httpDown.filter(s => s.self);
-  if (realDown.length) add(2,`${t('httpChecks')}${localeColon()}${realDown.map(x=>x.name).slice(0,3).join(', ')}`, 'network');
-  if (selfDown.length) add(1, t('selfCheckNeedsConfig'), 'network');
-  for (const check of data.httpChecks || []) {
-    if (!check.stale && check.tlsDays !== null && check.tlsDays < 14 && check.online) {
-      add(check.tlsDays < 3 ? 2 : 1,`${check.name}${localeColon()}${t('tlsExpires')} ${number(check.tlsDays,0)} ${t('days')}`, 'network');
-    }
-  }
+  if (swapping >= 10) add(swapping >= 100 ? 2 : 1, `${t('swapActivity')}${localeColon()}${number(swapping)} ${t('pagesPerSecond')}`, 'processes');
   for (const link of data.network || []) {
     if (link.category !== 'physical') continue;
     const rate = state.rates.network[link.name];
@@ -4250,27 +5769,45 @@ function renderHealth(data) {
       add(1,`${link.name}${localeColon()}${t('networkErrors')}`, 'network');
     }
   }
+  // Everything else is evaluated by the server (the same list feeds ?api=health and --check).
+  for (const alert of data.alerts || []) {
+    add(alert.level === 2 ? 2 : 1, alertText(alert), VIEWS.includes(alert.view) ? alert.view : null);
+  }
+  warnings.sort((a, b) => b.level - a.level); // critical first; the order is otherwise kept
+  const severity = warnings.length ? warnings[0].level : 0;
+  state.health = {severity, count: warnings.length};
   const panel = $('healthBanner');
   panel.className = 'health-banner ' + ['ok','warn','bad'][severity];
   setText('healthTitle',t(['healthy','healthWarn','healthCritical'][severity]));
   setText('healthDescription',severity ? t('healthNeedsAttention') : t('healthAllClear'));
   const list = $('healthReasons');
   list.replaceChildren();
-  for (const {reason, view} of warnings.slice(0,5)) {
-    const item = node('span','','• ');
+  if (warnings.length <= HEALTH_VISIBLE) healthExpanded = false;
+  const shown = healthExpanded ? warnings : warnings.slice(0, HEALTH_VISIBLE);
+  for (const {level, reason, view} of shown) {
+    const item = node('span','health-reason level-' + level);
+    item.append(node('i'));
     if (view) {
       const link = node('a','',reason);
       link.href = '?view=' + view;
       link.dataset.viewLink = view;
       item.append(link);
-    } else item.append(document.createTextNode(reason));
+    } else item.append(node('span','',reason));
     list.append(item);
   }
-  if (warnings.length > 5) list.append(node('span','',`+${warnings.length-5}`));
+  if (warnings.length > shown.length) {
+    const more = node('button','health-more',`+${warnings.length - shown.length}`);
+    more.type = 'button';
+    more.setAttribute('aria-label', t('showAllAlerts'));
+    more.title = t('showAllAlerts');
+    more.addEventListener('click', () => { healthExpanded = true; if (state.latest) renderHealth(state.latest); });
+    list.append(more);
+  }
   const swap = data.memory?.swap;
   if (!warnings.length && swap?.total > 0 && percentage(swap.used,swap.total) >= 50 && swapping < 1) {
     list.append(node('span','',t('swapIdle')));
   }
+  updateTitle();
 }
 
 // =============================================================
@@ -4336,6 +5873,18 @@ function renderSystem(data) {
     row(t('swapOut'), speedPages(state.rates.swapOut)),
     row(t('apiDuration'), data.collectionMs == null ? null : number(data.collectionMs) + ' ms'),
   );
+  const kernel = data.kernel || {};
+  for (const [key, pair] of [['openFiles', kernel.openFiles], ['conntrack', kernel.conntrack]]) {
+    if (!pair) continue;
+    // The limit on open files is practically unlimited on many systems: a percentage would mean nothing.
+    const share = pair.max < 1e12 ? ` / ${number(pair.max, 0)} (${pct(percentage(pair.used, pair.max))})` : '';
+    rows.append(row(t(key), number(pair.used, 0) + share));
+  }
+  if (Number.isFinite(kernel.oomKills)) {
+    const oomRow = row(t('oomKills'), number(kernel.oomKills, 0));
+    if (kernel.oomKills > 0) oomRow.querySelector('.value').classList.add('warn-text');
+    rows.append(oomRow);
+  }
   const reboot = data.reboot || {};
   const reasons = [];
   if ((reboot.reasons || []).includes('kernel')) {
@@ -4345,6 +5894,41 @@ function renderSystem(data) {
   const rebootRow = row(t('rebootRequired'), reboot.required ? t('yes') + (reasons.length ? ' · ' + reasons.join(' · ') : '') : t('rebootNo'));
   if (reboot.required) rebootRow.querySelector('.value').style.color = 'var(--warn)';
   rows.prepend(rebootRow);
+}
+
+function renderPhp(data) {
+  const php = data.php || {};
+  const list = [
+    row('PHP', php.version),
+    row(t('phpSapi'), php.sapi),
+    row(t('memoryLimit'), php.memoryLimit === '-1' ? '∞' : php.memoryLimit),
+  ];
+  const fpm = php.fpm;
+  if (fpm) {
+    list.push(row(t('fpmPool'), (fpm.pool || '—') + (fpm.manager ? ` (${fpm.manager})` : '')));
+    if (Number.isFinite(fpm.total)) list.push(row(t('fpmWorkers'), `${number(fpm.active, 0)} / ${number(fpm.total, 0)}`));
+    if (Number.isFinite(fpm.listenQueue)) {
+      const queue = row(t('fpmQueue'), number(fpm.listenQueue, 0));
+      if (fpm.listenQueue > 0) queue.querySelector('.value').classList.add('warn-text');
+      list.push(queue);
+    }
+    if (Number.isFinite(fpm.maxChildrenReached)) {
+      const reached = row(t('fpmMaxReached'), number(fpm.maxChildrenReached, 0) + ' ×');
+      if (fpm.maxChildrenReached > 0) reached.querySelector('.value').classList.add('warn-text');
+      list.push(reached);
+    }
+    if (Number.isFinite(fpm.slowRequests)) list.push(row(t('fpmSlow'), number(fpm.slowRequests, 0)));
+  }
+  const cache = php.opcache;
+  if (cache) {
+    const size = (cache.used || 0) + (cache.free || 0) + (cache.wasted || 0);
+    const memory = row(t('opcacheMemory'), `${bytes(cache.used)} / ${bytes(size)} (${pct(percentage(cache.used + (cache.wasted || 0), size))})`);
+    if (cache.full) memory.querySelector('.value').classList.add('warn-text');
+    list.push(memory);
+    if (Number.isFinite(cache.hitRate)) list.push(row(t('opcacheHitRate'), pct(cache.hitRate)));
+    if (Number.isFinite(cache.scripts)) list.push(row(t('opcacheScripts'), number(cache.scripts, 0)));
+  } else list.push(row('OPcache', t('disabledState')));
+  $('phpRows').replaceChildren(...list);
 }
 
 function renderChecks(data) {
@@ -4364,7 +5948,9 @@ function renderChecks(data) {
   for (const check of checks) {
     const status = check.online === null ? '' : (check.online ? 'up' : 'down');
     const label = check.online === null ? t('httpPending') : t(check.online ? 'onlineService' : 'offlineService');
-    const tls = check.tls && Number.isFinite(check.tlsDays) ? `${t('tlsExpires')}${localeColon()}${number(check.tlsDays, 0)} ${t('days')}` : '';
+    const tls = !check.tls || !Number.isFinite(check.tlsDays) ? ''
+      : check.tlsDays < 0 ? `${t('tlsExpired')}${localeColon()}${check.tlsExpiry}`
+      : `${t('tlsExpires')}${localeColon()}${number(check.tlsDays, 0)} ${t('days')}`;
     add(check.self ? t('selfCheck') : check.name, status, label, tls);
   }
 }
@@ -4398,6 +5984,179 @@ function renderPorts(data) {
   }
 }
 
+// ---- Network activity: connections, sessions, web traffic, Apache ----
+const expandedTraffic = new Set();
+function keptDetails(id, title) {
+  const details = node('details', 'details');
+  details.open = expandedTraffic.has(id); // redrawn at every refresh: remember what was opened
+  details.addEventListener('toggle', () => {
+    if (details.open) expandedTraffic.add(id);
+    else expandedTraffic.delete(id);
+  });
+  details.append(node('summary', '', title));
+  return details;
+}
+function trafficRow(title, detail, pillText, pillClass = '', tag = '') {
+  const item = node('div', 'check-row traffic-row');
+  const left = node('span', 'check-name');
+  left.append(node('strong', '', title));
+  if (tag) left.append(node('span', 'tag', tag));
+  if (detail) left.append(node('small', '', detail));
+  item.append(left);
+  if (pillText !== null) item.append(node('span', 'pill ' + pillClass, pillText));
+  return item;
+}
+function ago(epochSeconds) {
+  return t('agoText').replace('{s}', duration(Math.max(0, Date.now() / 1000 - epochSeconds)));
+}
+function renderConnections(traffic) {
+  const target = $('connectionsList');
+  const c = traffic.connections;
+  if (!c || !Array.isArray(c.services)) { empty(target); return; }
+  const rows = node('div', 'rows');
+  rows.append(
+    row(t('connIncoming'), `${number(c.incoming, 0)} · ${t('addressCount').replace('{n}', number(c.incomingAddresses, 0))}`),
+    row(t('connOutgoing'), number(c.outgoing, 0)),
+    row(t('connLocal'), number(c.local, 0)),
+  );
+  target.replaceChildren(rows, node('h3', 'list-title', t('connByService')));
+  if (!c.services.length) target.append(node('p', 'empty', t('connNone')));
+  for (const service of c.services) {
+    const clients = service.clients.map(client => client.ip + (client.count > 1 ? ' ×' + client.count : '')).join(', ')
+      + (service.addresses > service.clients.length ? ', …' : '');
+    target.append(trafficRow(service.port + (service.service ? ' · ' + service.service : ''), clients,
+      `${number(service.connections, 0)} · ${t('addressCount').replace('{n}', number(service.addresses, 0))}`));
+  }
+  if (c.destinations.length) {
+    const details = keptDetails('outgoing', `${t('connOutgoingList')} (${number(c.outgoingDestinations, 0)})`);
+    for (const destination of c.destinations) {
+      details.append(trafficRow(destination.ip, destination.port + (destination.service ? ' · ' + destination.service : ''),
+        destination.count > 1 ? '×' + destination.count : null));
+    }
+    target.append(details);
+  }
+  const sessions = traffic.sessions;
+  if (sessions?.available) {
+    target.append(node('h3', 'list-title', t('sessionsTitle')));
+    if (!sessions.sessions.length) target.append(node('p', 'empty', t('sessionsNone')));
+    for (const session of sessions.sessions) {
+      target.append(trafficRow(session.user, [session.line, session.from].filter(Boolean).join(' · '),
+        session.since ? ago(session.since) : null));
+    }
+  }
+}
+function minuteBars(series) {
+  const peak = Math.max(1, ...series);
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('class', 'mini-bars');
+  svg.setAttribute('viewBox', `0 0 ${series.length * 10} 40`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `${t('webPerMinute')}${localeColon()}${series.join(', ')}`);
+  series.forEach((count, index) => {
+    const height = count ? Math.max(2, 38 * count / peak) : 1;
+    const bar = document.createElementNS(svgNS, 'rect');
+    bar.setAttribute('x', String(index * 10 + 1));
+    bar.setAttribute('y', String(40 - height));
+    bar.setAttribute('width', '8');
+    bar.setAttribute('height', String(height));
+    if (!count) bar.setAttribute('class', 'zero');
+    const title = document.createElementNS(svgNS, 'title');
+    title.textContent = `−${series.length - index} min${localeColon()}${count}`;
+    bar.append(title);
+    svg.append(bar);
+  });
+  return svg;
+}
+function renderWebTraffic(traffic) {
+  const target = $('webTrafficList');
+  const web = traffic.web;
+  if (!web || !web.state) { empty(target); return; }
+  if (web.state !== 'ok') {
+    const message = node('p', 'empty', web.state === 'unreadable' ? t('webUnreadable').replace('{user}', web.user) : t('webMissing'));
+    target.replaceChildren(message);
+    if (web.state === 'unreadable' && web.command) {
+      // What the command implies comes first: it must be read before the command is copied.
+      const warning = node('p', 'acl-warning', t('webAclWarning').replaceAll('{user}', web.user));
+      warning.setAttribute('role', 'note');
+      target.append(warning, node('code', 'code-hint', web.command));
+      if (web.undo) target.append(node('p', 'smalltext', t('webAclUndo')), node('code', 'code-hint', web.undo));
+    }
+    return;
+  }
+  const people = web.visitors - web.bots;
+  const rows = node('div', 'rows');
+  const responses = row(t('webResponses'), '');
+  const line = node('span', 'status-line');
+  for (const family of ['2', '3', '4', '5']) {
+    if (web.status[family] > 0 || family === '2') line.append(node('span', 's' + family, `${family}xx${localeColon()}${number(web.status[family], 0)}`));
+  }
+  responses.querySelector('.value').replaceChildren(line);
+  rows.append(
+    row(t('webRequests').replace('{m}', web.minutes), `${number(web.requests, 0)} · ${number(web.requests / web.minutes)} /min`),
+    row(t('webVisitors'), number(people, 0)),
+    row(t('webBots'), number(web.bots, 0)),
+    responses,
+    row(t('webSent'), bytes(web.bytes)),
+  );
+  const axis = node('div', 'mini-axis');
+  axis.append(node('span', '', `−${web.minutes} min`), node('span', '', t('webPerMinute')), node('span', '', t('nowWord')));
+  target.replaceChildren(rows, minuteBars(web.series), axis);
+  if (web.coveredSeconds < web.minutes * 60 - 30) target.append(node('p', 'smalltext', t('webPartial').replace('{s}', duration(web.coveredSeconds))));
+  if (!web.requests) { target.append(node('p', 'empty', t('webNone'))); return; }
+  target.append(node('h3', 'list-title', t('webTopClients')));
+  for (const client of web.clients) {
+    target.append(trafficRow(client.ip, `${client.page} · ${ago(client.last)}`,
+      number(client.requests, 0) + (client.errors ? ` · ${t('errorCount').replace('{n}', number(client.errors, 0))}` : ''),
+      client.errors && client.errors >= client.requests / 2 ? 'warn' : '', client.bot ? t('botTag') : ''));
+  }
+  target.append(node('h3', 'list-title', t('webTopPages')));
+  for (const page of web.pages) target.append(trafficRow(page.page, '', number(page.count, 0)));
+  if (web.errors.length) {
+    const details = keptDetails('errors', `${t('webTopErrors')} (${number(web.status['4'] + web.status['5'], 0)})`);
+    for (const error of web.errors) details.append(trafficRow(error.page, '', `${error.status} · ×${number(error.count, 0)}`, error.status >= 500 ? 'down' : 'warn'));
+    target.append(details);
+  }
+}
+let apachePrevious = null;
+function renderApache(traffic) {
+  const target = $('apacheList');
+  const apache = traffic.apache;
+  if (!apache || !apache.state || apache.state === 'disabled') { empty(target, t('apacheDisabled')); return; }
+  if (apache.state !== 'ok') {
+    target.replaceChildren(node('p', 'empty', t('apacheOff').replace('{detail}', apache.httpStatus ? 'HTTP ' + apache.httpStatus : t('unknown'))),
+      node('code', 'code-hint', 'sudo a2enmod status && sudo systemctl reload apache2'));
+    apachePrevious = null;
+    return;
+  }
+  const rows = node('div', 'rows');
+  let rate = null;
+  if (apachePrevious && apache.atMs > apachePrevious.atMs && apache.totalAccesses >= apachePrevious.totalAccesses) {
+    rate = (apache.totalAccesses - apachePrevious.totalAccesses) / ((apache.atMs - apachePrevious.atMs) / 1000);
+  }
+  if (!apachePrevious || apache.atMs !== apachePrevious.atMs) {
+    if (rate !== null) apache.rate = rate;
+    else if (apachePrevious?.rate != null && apache.totalAccesses >= apachePrevious.totalAccesses) apache.rate = apachePrevious.rate;
+    apachePrevious = apache;
+  }
+  if (Number.isFinite(apache.totalAccesses)) rows.append(row(t('apacheRate'), apachePrevious.rate == null ? t('estimating') : number(apachePrevious.rate) + ' /s'));
+  if (Number.isFinite(apache.busy)) rows.append(row(t('apacheWorkers'), `${number(apache.busy, 0)} / ${number(apache.busy + (apache.idle || 0), 0)}`));
+  if (Number.isFinite(apache.keepalive)) rows.append(row(t('apacheKeepalive'), number(apache.keepalive, 0)));
+  if (Number.isFinite(apache.uptimeSeconds)) rows.append(row(t('apacheUptime'), duration(apache.uptimeSeconds)));
+  target.replaceChildren(rows, node('h3', 'list-title', t('apacheInFlight')));
+  if (!apache.extended) { target.append(node('p', 'empty', t('apacheNotExtended'))); return; }
+  if (!apache.requests.length) target.append(node('p', 'empty', t('apacheIdle')));
+  for (const request of apache.requests) {
+    target.append(trafficRow([request.method, request.vhost + request.path].filter(Boolean).join(' ') || '—', request.client,
+      request.seconds == null ? null : duration(request.seconds), request.seconds >= 30 ? 'warn' : ''));
+  }
+}
+function renderTraffic(data) {
+  renderConnections(data.traffic);
+  renderWebTraffic(data.traffic);
+  renderApache(data.traffic);
+}
+
 function speedPages(value) {
   return value == null ? '—' : number(value) + ' ' + t('pagesPerSecond');
 }
@@ -4416,6 +6175,7 @@ function renderCores() {
   }
 }
 
+const expandedDisks = new Set();
 function renderDisks(data) {
   const target = $('disksList');
   target.replaceChildren();
@@ -4432,13 +6192,19 @@ function renderDisks(data) {
     if (disk.inodes && disk.inodes.total > 0) {
       const ipct = percentage(disk.inodes.used,disk.inodes.total);
       item.append(node('div','inode-line', `${t('inodes')}: ${pct(ipct)} · ${number(disk.inodes.free,0)} ${t('free')}`));
-    } else if (!/^(?:fuse(?:\.|$)|nfs|cifs|smb|sshfs|davfs)/i.test(disk.type || '')) {
+    } else if (!disk.inodes && !/^(?:fuse(?:\.|$)|nfs|cifs|smb|sshfs|davfs)/i.test(disk.type || '')) {
       item.append(node('div','inode-line', `${t('inodes')}: ${t('unknown')}`));
     }
 
     const aliases = (disk.mounts || []).filter(name => name !== disk.mount);
     if (aliases.length) {
       const details = node('details', 'details');
+      // The panel is redrawn at every refresh: remember what the user opened.
+      details.open = expandedDisks.has(disk.mount);
+      details.addEventListener('toggle', () => {
+        if (details.open) expandedDisks.add(disk.mount);
+        else expandedDisks.delete(disk.mount);
+      });
       const summary = node('summary', '', `${t('extraMounts')} (${aliases.length})`);
       const content = node('div', 'smalltext', aliases.join(' · '));
       details.append(summary, content);
@@ -4564,6 +6330,15 @@ function renderHardware(data) {
     if (sensor.kind === 'disk' && sensor.name) label += ' · ' + sensor.name;
     target.append(row(label, number(sensor.celsius) + ' °C'));
   }
+  for (const array of data.raid || []) {
+    const status = array.degraded ? t('raidDegraded')
+      : array.sync ? `${t(array.sync.action === 'check' ? 'raidChecking' : 'raidRebuilding')} ${pct(array.sync.percent)}`
+      : t('raidHealthy');
+    const disks = Number.isFinite(array.devices) ? ` · ${array.working}/${array.devices}` : '';
+    const raidRow = row(`RAID · ${array.name}`, `${array.level ? array.level + ' · ' : ''}${status}${disks}`);
+    if (array.degraded) raidRow.querySelector('.value').classList.add('bad-text');
+    target.append(raidRow);
+  }
   const gpus = data.gpus || [];
   gpus.forEach((gpu, index) => {
     const suffix = gpus.length > 1 ? ' ' + (index + 1) : '';
@@ -4598,7 +6373,7 @@ function renderPressure(data) {
 }
 
 // =============================================================
-// 24. PANEL RENDERING
+// 25. LANGUAGE AND STYLE
 // =============================================================
 function applyLanguage() {
   document.documentElement.lang = lang;
@@ -4633,15 +6408,25 @@ function applyLanguage() {
   if (state.latest) render(state.latest);
   updateViewChrome();
   setText('connectionText', state.connected ? t('online') : (state.latest ? t('offline') : t('connecting')));
-  if ($('errorBanner').classList.contains('show')) {
-    $('errorBanner').textContent = t('refreshError') + ' (' + state.errorDetail + ')';
-  }
+  if ($('errorBanner').classList.contains('show')) $('errorBanner').textContent = errorBannerText();
+}
+// "Auto" follows the light or dark setting of the device.
+const darkScheme = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+function resolvedStyle() {
+  if (visualStyle !== 'auto') return visualStyle;
+  return darkScheme && !darkScheme.matches ? 'pro' : 'operations';
 }
 function applyStyle() {
-  document.documentElement.dataset.style = visualStyle;
+  const style = resolvedStyle();
+  document.documentElement.dataset.style = style;
   $('styleChoice').value = visualStyle;
-  document.querySelector('meta[name="color-scheme"]').content = visualStyle === 'pro' ? 'light dark' : 'dark light';
+  document.querySelector('meta[name="color-scheme"]').content = style === 'pro' ? 'light dark' : 'dark light';
 }
+darkScheme?.addEventListener?.('change', () => {
+  if (visualStyle !== 'auto') return;
+  applyStyle();
+  renderCharts();
+});
 $('language').addEventListener('change', event => {
   if (!words[event.target.value]) return;
   lang = event.target.value;
@@ -4657,19 +6442,17 @@ $('styleChoice').addEventListener('change', event => {
   applyStyle();
   requestAnimationFrame(() => { layoutDashboard(true); rebalanceDashboardOnce(); });
 });
-$('refresh').addEventListener('click', () => poll());
+$('refresh').addEventListener('click', () => poll(true));
 
 // =============================================================
-// 26. PREFERENCES AND DIALOGS
-// =============================================================
-// =============================================================
+// 26. LAYOUT, PREFERENCES AND DIALOGS
 // =============================================================
 let currentDashboardColumns = 0;
 let dashboardMeasured = false;
 const panelHeights = {};
 const panelWeights = {
   activity:2.8, system:1.3, processes:1.8, network:2.0, storage:1.9,
-  http:1.0, services:1.0, hardware:1.2, pressure:.8, checks:1.0, failed:.6, ports:1.6,
+  http:1.0, services:1.0, hardware:1.2, pressure:.8, checks:1.0, failed:.6, ports:1.6, php:1.3, connections:1.6, webtraffic:2.6, apache:1.2,
 };
 function layoutDashboard(force = false) {
   const dashboard = document.querySelector('.dashboard');
@@ -4814,7 +6597,9 @@ $('graphPeriod').addEventListener('change', event => {
 for (const name of ['cpu','ram','disk']) {
   const input = $('warn'+name[0].toUpperCase()+name.slice(1));
   input.addEventListener('change', () => {
-    thresholds[name]=validChoice(input.value,Array.from({length:46},(_,i)=>i+50),85);
+    // Out-of-range values are brought back to the nearest limit instead of being discarded.
+    const typed = Math.round(Number(input.value));
+    thresholds[name]=Number.isFinite(typed) && input.value !== '' ? Math.max(50,Math.min(95,typed)) : 85;
     input.value=String(thresholds[name]);
     saveSetting('esm32Warn'+name[0].toUpperCase()+name.slice(1),String(thresholds[name]));
     if (state.latest) renderHealth(state.latest);
@@ -4854,23 +6639,29 @@ function render(data) {
   state.latest = data;
   renderSummary(data);
   renderHealth(data);
-  renderSystem(data);
-  renderHttp(data);
-  renderCores();
-  renderDisks(data);
-  renderDiskIo(data);
-  renderNetwork(data);
-  renderServices(data);
-  renderPressure(data);
-  renderChecks(data);
-  renderFailedUnits(data);
-  renderPorts(data);
-  // Modules collected only for one page: render them only when they belong to the page shown.
-  if (data.view === currentView && data.processes) {
-    if (currentView === 'processes') renderProcessDetail(data); else renderProcesses(data);
-  }
-  if (data.view === currentView && Array.isArray(data.temperatures)) renderHardware(data);
   renderCharts();
+  // Panels are rebuilt at every refresh, which would drop a text selection: while the user is
+  // selecting (to copy an address, a unit name...), they keep their content until the next refresh.
+  if (!userIsSelecting()) {
+    renderSystem(data);
+    renderPhp(data);
+    renderHttp(data);
+    renderCores();
+    renderDisks(data);
+    renderDiskIo(data);
+    renderNetwork(data);
+    renderServices(data);
+    renderPressure(data);
+    renderChecks(data);
+    renderFailedUnits(data);
+    renderPorts(data);
+    if (data.view === currentView && data.traffic) renderTraffic(data);
+    // Modules collected only for one page: render them only when they belong to the page shown.
+    if (data.view === currentView && data.processes) {
+      if (currentView === 'processes') renderProcessDetail(data); else renderProcesses(data);
+    }
+    if (data.view === currentView && Array.isArray(data.temperatures)) renderHardware(data);
+  }
   if (!dashboardMeasured && currentDashboardColumns >= 3) requestAnimationFrame(rebalanceDashboardOnce);
 }
 
@@ -4878,22 +6669,39 @@ function showOnline() {
   $('connectionDot').className = 'dot ok';
   state.connected = true;
   state.errorDetail = '';
+  state.failures = 0;
+  state.lastSuccess = Date.now();
   setText('connectionText', t('online'));
   $('errorBanner').classList.remove('show');
+  delete document.documentElement.dataset.stale;
+  updateTitle();
+}
+function errorBannerText() {
+  const age = state.lastSuccess ? duration((Date.now() - state.lastSuccess) / 1000) : '';
+  return t('refreshError') + ' (' + state.errorDetail + ')' + (age ? ' ' + t('lastDataAgo').replace('{s}', age) : '');
 }
 function showOffline(error) {
   $('connectionDot').className = 'dot error';
   state.connected = false;
   setText('connectionText', t('offline'));
   state.errorDetail = String(error?.message || 'error');
-  $('errorBanner').textContent = t('refreshError') + ' (' + state.errorDetail + ')';
+  // Retry less and less often (up to once a minute) instead of hammering a server in trouble.
+  state.failures = Math.min(8, state.failures + 1);
+  state.retryAt = Date.now() + Math.min(60000, refreshSeconds * 1000 * 2 ** (state.failures - 1)) - 500;
+  $('errorBanner').textContent = errorBannerText();
   $('errorBanner').classList.add('show');
+  document.documentElement.dataset.stale = '1'; // dims the figures: they are no longer current
+  updateTitle();
 }
-async function poll() {
-  if (!state.active && (BACKGROUND_REFRESH_SECONDS <= 0 || Date.now() - (state.lastPoll || 0) < BACKGROUND_REFRESH_SECONDS * 1000 - 500)) return;
+let pollCount = 0;
+async function poll(force = false) {
+  force = force === true; // setInterval and event listeners pass other arguments
+  if (!force && !state.active && (BACKGROUND_REFRESH_SECONDS <= 0 || Date.now() - (state.lastPoll || 0) < BACKGROUND_REFRESH_SECONDS * 1000 - 500)) return;
+  if (!force && state.failures > 0 && Date.now() < state.retryAt) return;
   if (state.busy) { state.repoll = true; return; }
   state.busy = true;
-  state.lastPoll = Date.now();  try {
+  state.lastPoll = Date.now();
+  try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(8000, refreshSeconds * 2000));
     let response;
@@ -4923,6 +6731,7 @@ async function poll() {
     if (state.historyTimes.length > HISTORY_LIMIT) state.historyTimes.shift();
     render(data);
     showOnline();
+    if (++pollCount % 3 === 0) saveHistory();
   } catch (error) {
     showOffline(error);
     state.previous = null;
@@ -4987,7 +6796,7 @@ document.addEventListener('visibilitychange', () => {
   state.active = !document.hidden;
   if (state.active) {
     if (BACKGROUND_REFRESH_SECONDS <= 0) state.previous = null;
-    poll();
+    poll(true);
   }
 });
 function updateViewChrome() {
@@ -4999,7 +6808,31 @@ function updateViewChrome() {
       if (tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = Math.max(0, link.offsetLeft - tabs.offsetLeft - 16);
     } else link.removeAttribute('aria-current');
   }
-  document.title = currentView === 'overview' ? PAGE_TITLE : t(VIEW_LABELS[currentView]) + ' · ' + PAGE_TITLE;
+  updateTitle();
+}
+// Tab title and icon: which server this is and how it is doing, readable among many tabs.
+const faviconLink = document.querySelector('link[rel="icon"]');
+const faviconDefault = faviconLink?.getAttribute('href');
+let faviconColor = '';
+function statusFavicon(color) {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect x="4" y="4" width="56" height="56" rx="12" fill="#020711"/>'
+    + '<rect x="12" y="14" width="34" height="27" rx="4" fill="none" stroke="#fff" stroke-width="2.6"/>'
+    + '<path d="M16 28h7l3.6-7.4 5.4 12.2 4.2-4.8h6" fill="none" stroke="#3affec" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>'
+    + `<circle cx="46" cy="46" r="13" fill="${color}" stroke="#020711" stroke-width="3"/></svg>`;
+  return 'data:image/svg+xml,' + encodeURIComponent(svg);
+}
+function updateTitle() {
+  const offline = !state.connected && Boolean(state.latest);
+  const {severity, count} = state.health;
+  const badge = offline ? '⏸ ' : severity === 2 ? `⛔ ${count} · ` : severity === 1 ? `⚠ ${count} · ` : '';
+  const host = state.latest?.system?.hostname;
+  const name = [host, currentView === 'overview' ? null : t(VIEW_LABELS[currentView]), host ? APP_TITLE : PAGE_TITLE].filter(Boolean).join(' · ');
+  document.title = badge + name;
+  const color = offline ? '#8a97a8' : severity === 2 ? '#f07e88' : severity === 1 ? '#edbd72' : '';
+  if (faviconLink && color !== faviconColor) {
+    faviconColor = color;
+    faviconLink.setAttribute('href', color ? statusFavicon(color) : faviconDefault);
+  }
 }
 function switchView(view, push = true) {
   if (!VIEWS.includes(view)) view = 'overview';
@@ -5023,6 +6856,7 @@ document.addEventListener('click', event => {
 window.addEventListener('popstate', () => {
   switchView(new URLSearchParams(location.search).get('view') || 'overview', false);
 });
+restoreHistory();
 updateViewChrome();
 applyStyle();
 applyPreferences();
